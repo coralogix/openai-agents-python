@@ -29,6 +29,7 @@ from agents._run_impl import (
 )
 from agents.handoffs import handoff
 from agents.run import AgentRunner
+from agents.handoffs import handoff
 from agents.tool import function_tool
 from agents.tool_context import ToolContext
 
