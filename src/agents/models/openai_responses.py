@@ -240,6 +240,11 @@ class OpenAIResponsesModel(Model):
         converted_tools = Converter.convert_tools(tools, handoffs)
         response_format = Converter.get_response_format(output_schema)
 
+        # When store is set to False, we need to include the reasoning content for the preceeding
+        # response.
+        if not model_settings.store:
+            converted_tools.includes.append("reasoning.encrypted_content")
+
         if _debug.DONT_LOG_MODEL_DATA:
             logger.debug("Calling LLM")
         else:
