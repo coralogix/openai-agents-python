@@ -2,33 +2,33 @@
 search:
   exclude: true
 ---
-# LiteLLM 経由でのモデル利用
+# LiteLLM による任意モデルの使用
 
 !!! note
 
-    LiteLLM との統合は現在ベータ版です。特に小規模なモデルプロバイダーでは問題が発生する可能性があります。問題を見つけた場合は、[GitHub Issues](https://github.com/openai/openai-agents-python/issues) からご報告ください。迅速に対応いたします。
+    LiteLLM 統合は ベータ です。特に小規模なモデルプロバイダーでは問題が発生する可能性があります。問題があれば [GitHub issues](https://github.com/openai/openai-agents-python/issues) からご報告ください。迅速に修正します。
 
-[LiteLLM](https://docs.litellm.ai/docs/) は、1 つのインターフェースで 100 以上のモデルを利用できるライブラリです。Agents SDK では LiteLLM との統合により、任意の AI モデルを使用できます。
+[LiteLLM](https://docs.litellm.ai/docs/) は、単一のインターフェースで 100 以上のモデルを利用できるライブラリです。Agents SDK で任意の AI モデルを使えるようにするため、LiteLLM 統合を追加しました。
 
 ## セットアップ
 
-`litellm` がインストールされていることを確認してください。オプションの `litellm` 依存関係グループをインストールすることで対応できます。
+`litellm` を利用可能にする必要があります。オプションの `litellm` 依存関係グループをインストールしてください。
 
 ```bash
 pip install "openai-agents[litellm]"
 ```
 
-インストール後、任意のエージェントで [`LitellmModel`][agents.extensions.models.litellm_model.LitellmModel] を利用できます。
+完了したら、任意の エージェント で [`LitellmModel`][agents.extensions.models.litellm_model.LitellmModel] を使用できます。
 
 ## 例
 
-以下は動作する完全なサンプルです。実行するとモデル名と API キーの入力を求められます。例えば次のように入力できます。
+これは完全に動作するサンプルです。実行するとモデル名と API キーの入力を求められます。例えば次のように入力できます。
 
--   `openai/gpt-4.1` をモデル名に、OpenAI API キーを入力  
--   `anthropic/claude-3-5-sonnet-20240620` をモデル名に、Anthropic API キーを入力  
--   その他
+-   モデルに `openai/gpt-4.1`、OpenAI の API キー
+-   モデルに `anthropic/claude-3-5-sonnet-20240620`、Anthropic の API キー
+-   など
 
-LiteLLM でサポートされているモデルの全リストは、[litellm providers docs](https://docs.litellm.ai/docs/providers) を参照してください。
+LiteLLM でサポートされているモデルの一覧は、[プロバイダーのドキュメント](https://docs.litellm.ai/docs/providers)をご覧ください。
 
 ```python
 from __future__ import annotations
@@ -75,3 +75,30 @@ if __name__ == "__main__":
 
     asyncio.run(main(model, api_key))
 ```
+
+## 使用状況データの追跡
+
+LiteLLM のレスポンスを Agents SDK の使用状況メトリクスに反映させたい場合は、エージェント作成時に `ModelSettings(include_usage=True)` を渡してください。
+
+```python
+from agents import Agent, ModelSettings
+from agents.extensions.models.litellm_model import LitellmModel
+
+agent = Agent(
+    name="Assistant",
+    model=LitellmModel(model="your/model", api_key="..."),
+    model_settings=ModelSettings(include_usage=True),
+)
+```
+
+`include_usage=True` の場合、LiteLLM のリクエストは、組み込みの OpenAI モデルと同様に、`result.context_wrapper.usage` を通じてトークン数およびリクエスト数をレポートします。
+
+## トラブルシューティング
+
+LiteLLM のレスポンスで Pydantic シリアライザーの警告が表示される場合は、次を設定して小さな互換性パッチを有効にしてください。
+
+```bash
+export OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH=true
+```
+
+このオプトインのフラグは、既知の LiteLLM シリアライザー警告を抑制しつつ通常の動作を維持します。不要な場合はオフにしてください（未設定または `false`）。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import queue
 import random
@@ -22,18 +23,27 @@ class ConsoleSpanExporter(TracingExporter):
     def export(self, items: list[Trace | Span[Any]]) -> None:
         for item in items:
             if isinstance(item, Trace):
-                print(f"[Exporter] Export trace_id={item.trace_id}, name={item.name}, ")
+                print(f"[Exporter] Export trace_id={item.trace_id}, name={item.name}")
             else:
                 print(f"[Exporter] Export span: {item.export()}")
 
 
 class BackendSpanExporter(TracingExporter):
+    _OPENAI_TRACING_INGEST_ENDPOINT = "https://api.openai.com/v1/traces/ingest"
+    _OPENAI_TRACING_ALLOWED_USAGE_KEYS = frozenset(
+        {
+            "input_tokens",
+            "output_tokens",
+        }
+    )
+    _UNSERIALIZABLE = object()
+
     def __init__(
         self,
         api_key: str | None = None,
         organization: str | None = None,
         project: str | None = None,
-        endpoint: str = "https://api.openai.com/v1/traces/ingest",
+        endpoint: str = _OPENAI_TRACING_INGEST_ENDPOINT,
         max_retries: int = 3,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
@@ -69,9 +79,12 @@ class BackendSpanExporter(TracingExporter):
             api_key: The OpenAI API key to use. This is the same key used by the OpenAI Python
                 client.
         """
-        # We're specifically setting the underlying cached property as well
+        # Clear the cached property if it exists
+        if "api_key" in self.__dict__:
+            del self.__dict__["api_key"]
+
+        # Update the private attribute
         self._api_key = api_key
-        self.api_key = api_key
 
     @cached_property
     def api_key(self):
@@ -89,62 +102,199 @@ class BackendSpanExporter(TracingExporter):
         if not items:
             return
 
-        if not self.api_key:
-            logger.warning("OPENAI_API_KEY is not set, skipping trace export")
-            return
+        grouped_items: dict[str | None, list[Trace | Span[Any]]] = {}
+        for item in items:
+            key = item.tracing_api_key
+            grouped_items.setdefault(key, []).append(item)
 
-        data = [item.export() for item in items if item.export()]
-        payload = {"data": data}
+        for item_key, grouped in grouped_items.items():
+            api_key = item_key or self.api_key
+            if not api_key:
+                logger.warning("OPENAI_API_KEY is not set, skipping trace export")
+                continue
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "OpenAI-Beta": "traces=v1",
-        }
+            sanitize_for_openai = self._should_sanitize_for_openai_tracing_api()
+            data: list[dict[str, Any]] = []
+            for item in grouped:
+                exported = item.export()
+                if exported:
+                    if sanitize_for_openai:
+                        exported = self._sanitize_for_openai_tracing_api(exported)
+                    data.append(exported)
+            payload = {"data": data}
 
-        if self.organization:
-            headers["OpenAI-Organization"] = self.organization
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "OpenAI-Beta": "traces=v1",
+            }
 
-        if self.project:
-            headers["OpenAI-Project"] = self.project
+            if self.organization:
+                headers["OpenAI-Organization"] = self.organization
 
-        # Exponential backoff loop
-        attempt = 0
-        delay = self.base_delay
-        while True:
-            attempt += 1
-            try:
-                response = self._client.post(url=self.endpoint, headers=headers, json=payload)
+            if self.project:
+                headers["OpenAI-Project"] = self.project
 
-                # If the response is successful, break out of the loop
-                if response.status_code < 300:
-                    logger.debug(f"Exported {len(items)} items")
-                    return
+            # Exponential backoff loop
+            attempt = 0
+            delay = self.base_delay
+            while True:
+                attempt += 1
+                try:
+                    response = self._client.post(url=self.endpoint, headers=headers, json=payload)
 
-                # If the response is a client error (4xx), we wont retry
-                if 400 <= response.status_code < 500:
-                    logger.error(
-                        f"[non-fatal] Tracing client error {response.status_code}: {response.text}"
+                    # If the response is successful, break out of the loop
+                    if response.status_code < 300:
+                        logger.debug(f"Exported {len(grouped)} items")
+                        break
+
+                    # If the response is a client error (4xx), we won't retry
+                    if 400 <= response.status_code < 500:
+                        logger.error(
+                            "[non-fatal] Tracing client error %s: %s",
+                            response.status_code,
+                            response.text,
+                        )
+                        break
+
+                    # For 5xx or other unexpected codes, treat it as transient and retry
+                    logger.warning(
+                        f"[non-fatal] Tracing: server error {response.status_code}, retrying."
                     )
-                    return
+                except httpx.RequestError as exc:
+                    # Network or other I/O error, we'll retry
+                    logger.warning(f"[non-fatal] Tracing: request failed: {exc}")
 
-                # For 5xx or other unexpected codes, treat it as transient and retry
-                logger.warning(
-                    f"[non-fatal] Tracing: server error {response.status_code}, retrying."
-                )
-            except httpx.RequestError as exc:
-                # Network or other I/O error, we'll retry
-                logger.warning(f"[non-fatal] Tracing: request failed: {exc}")
+                # If we reach here, we need to retry or give up
+                if attempt >= self.max_retries:
+                    logger.error(
+                        "[non-fatal] Tracing: max retries reached, giving up on this batch."
+                    )
+                    break
 
-            # If we reach here, we need to retry or give up
-            if attempt >= self.max_retries:
-                logger.error("[non-fatal] Tracing: max retries reached, giving up on this batch.")
-                return
+                # Exponential backoff + jitter
+                sleep_time = delay + random.uniform(0, 0.1 * delay)  # 10% jitter
+                time.sleep(sleep_time)
+                delay = min(delay * 2, self.max_delay)
 
-            # Exponential backoff + jitter
-            sleep_time = delay + random.uniform(0, 0.1 * delay)  # 10% jitter
-            time.sleep(sleep_time)
-            delay = min(delay * 2, self.max_delay)
+    def _should_sanitize_for_openai_tracing_api(self) -> bool:
+        return self.endpoint.rstrip("/") == self._OPENAI_TRACING_INGEST_ENDPOINT.rstrip("/")
+
+    def _sanitize_for_openai_tracing_api(self, payload_item: dict[str, Any]) -> dict[str, Any]:
+        """Move unsupported generation usage fields under usage.details for traces ingest."""
+        span_data = payload_item.get("span_data")
+        if not isinstance(span_data, dict):
+            return payload_item
+
+        if span_data.get("type") != "generation":
+            return payload_item
+
+        usage = span_data.get("usage")
+        if not isinstance(usage, dict):
+            return payload_item
+
+        sanitized_usage = self._sanitize_generation_usage_for_openai_tracing_api(usage)
+
+        if sanitized_usage is None:
+            sanitized_span_data = dict(span_data)
+            sanitized_span_data.pop("usage", None)
+            sanitized_payload_item = dict(payload_item)
+            sanitized_payload_item["span_data"] = sanitized_span_data
+            return sanitized_payload_item
+
+        if sanitized_usage == usage:
+            return payload_item
+
+        sanitized_span_data = dict(span_data)
+        sanitized_span_data["usage"] = sanitized_usage
+        sanitized_payload_item = dict(payload_item)
+        sanitized_payload_item["span_data"] = sanitized_span_data
+        return sanitized_payload_item
+
+    def _sanitize_generation_usage_for_openai_tracing_api(
+        self, usage: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if not self._is_finite_json_number(input_tokens) or not self._is_finite_json_number(
+            output_tokens
+        ):
+            return None
+
+        details: dict[str, Any] = {}
+        existing_details = usage.get("details")
+        if isinstance(existing_details, dict):
+            for key, value in existing_details.items():
+                if not isinstance(key, str):
+                    continue
+                sanitized_value = self._sanitize_json_compatible_value(value)
+                if sanitized_value is self._UNSERIALIZABLE:
+                    continue
+                details[key] = sanitized_value
+
+        for key, value in usage.items():
+            if key in self._OPENAI_TRACING_ALLOWED_USAGE_KEYS or key == "details" or value is None:
+                continue
+            sanitized_value = self._sanitize_json_compatible_value(value)
+            if sanitized_value is self._UNSERIALIZABLE:
+                continue
+            details[key] = sanitized_value
+
+        sanitized_usage: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        if details:
+            sanitized_usage["details"] = details
+        return sanitized_usage
+
+    def _is_finite_json_number(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return False
+        return isinstance(value, int | float) and not (
+            isinstance(value, float) and not math.isfinite(value)
+        )
+
+    def _sanitize_json_compatible_value(self, value: Any, seen_ids: set[int] | None = None) -> Any:
+        if value is None or isinstance(value, str | bool | int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else self._UNSERIALIZABLE
+        if seen_ids is None:
+            seen_ids = set()
+        if isinstance(value, dict):
+            value_id = id(value)
+            if value_id in seen_ids:
+                return self._UNSERIALIZABLE
+            seen_ids.add(value_id)
+            sanitized_dict: dict[str, Any] = {}
+            try:
+                for key, nested_value in value.items():
+                    if not isinstance(key, str):
+                        continue
+                    sanitized_nested = self._sanitize_json_compatible_value(nested_value, seen_ids)
+                    if sanitized_nested is self._UNSERIALIZABLE:
+                        continue
+                    sanitized_dict[key] = sanitized_nested
+            finally:
+                seen_ids.remove(value_id)
+            return sanitized_dict
+        if isinstance(value, list | tuple):
+            value_id = id(value)
+            if value_id in seen_ids:
+                return self._UNSERIALIZABLE
+            seen_ids.add(value_id)
+            sanitized_list: list[Any] = []
+            try:
+                for nested_value in value:
+                    sanitized_nested = self._sanitize_json_compatible_value(nested_value, seen_ids)
+                    if sanitized_nested is self._UNSERIALIZABLE:
+                        continue
+                    sanitized_list.append(sanitized_nested)
+            finally:
+                seen_ids.remove(value_id)
+            return sanitized_list
+        return self._UNSERIALIZABLE
 
     def close(self):
         """Close the underlying HTTP client."""
@@ -183,7 +333,7 @@ class BatchTraceProcessor(TracingProcessor):
         self._shutdown_event = threading.Event()
 
         # The queue size threshold at which we export immediately.
-        self._export_trigger_size = int(max_queue_size * export_trigger_ratio)
+        self._export_trigger_size = max(1, int(max_queue_size * export_trigger_ratio))
 
         # Track when we next *must* perform a scheduled export
         self._next_export_time = time.time() + self._schedule_delay
@@ -269,8 +419,7 @@ class BatchTraceProcessor(TracingProcessor):
 
     def _export_batches(self, force: bool = False):
         """Drains the queue and exports in batches. If force=True, export everything.
-        Otherwise, export up to `max_batch_size` repeatedly until the queue is empty or below a
-        certain threshold.
+        Otherwise, export up to `max_batch_size` repeatedly until the queue is completely empty.
         """
         while True:
             items_to_export: list[Span[Any] | Trace] = []
@@ -293,16 +442,47 @@ class BatchTraceProcessor(TracingProcessor):
             self._exporter.export(items_to_export)
 
 
-# Create a shared global instance:
-_global_exporter = BackendSpanExporter()
-_global_processor = BatchTraceProcessor(_global_exporter)
+# Lazily initialized defaults to avoid creating network clients or threading
+# primitives during module import (important for fork-based process models).
+_global_exporter: BackendSpanExporter | None = None
+_global_processor: BatchTraceProcessor | None = None
+_global_lock = threading.Lock()
 
 
 def default_exporter() -> BackendSpanExporter:
     """The default exporter, which exports traces and spans to the backend in batches."""
-    return _global_exporter
+    global _global_exporter
+
+    exporter = _global_exporter
+    if exporter is not None:
+        return exporter
+
+    with _global_lock:
+        exporter = _global_exporter
+        if exporter is None:
+            exporter = BackendSpanExporter()
+            _global_exporter = exporter
+
+    return exporter
 
 
 def default_processor() -> BatchTraceProcessor:
     """The default processor, which exports traces and spans to the backend in batches."""
-    return _global_processor
+    global _global_exporter
+    global _global_processor
+
+    processor = _global_processor
+    if processor is not None:
+        return processor
+
+    with _global_lock:
+        processor = _global_processor
+        if processor is None:
+            exporter = _global_exporter
+            if exporter is None:
+                exporter = BackendSpanExporter()
+                _global_exporter = exporter
+            processor = BatchTraceProcessor(exporter)
+            _global_processor = processor
+
+    return processor

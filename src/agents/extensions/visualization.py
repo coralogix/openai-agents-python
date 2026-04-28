@@ -4,7 +4,6 @@ import graphviz  # type: ignore
 
 from agents import Agent
 from agents.handoffs import Handoff
-from agents.tool import Tool
 
 
 def get_main_graph(agent: Agent) -> str:
@@ -71,6 +70,12 @@ def get_all_nodes(
             f"fillcolor=lightgreen, width=0.5, height=0.3];"
         )
 
+    for mcp_server in agent.mcp_servers:
+        parts.append(
+            f'"{mcp_server.name}" [label="{mcp_server.name}", shape=box, style=filled, '
+            f"fillcolor=lightgrey, width=1, height=0.5];"
+        )
+
     for handoff in agent.handoffs:
         if isinstance(handoff, Handoff):
             parts.append(
@@ -119,6 +124,11 @@ def get_all_edges(
         "{agent.name}" -> "{tool.name}" [style=dotted, penwidth=1.5];
         "{tool.name}" -> "{agent.name}" [style=dotted, penwidth=1.5];""")
 
+    for mcp_server in agent.mcp_servers:
+        parts.append(f"""
+        "{agent.name}" -> "{mcp_server.name}" [style=dashed, penwidth=1.5];
+        "{mcp_server.name}" -> "{agent.name}" [style=dashed, penwidth=1.5];""")
+
     for handoff in agent.handoffs:
         if isinstance(handoff, Handoff):
             parts.append(f"""
@@ -128,7 +138,7 @@ def get_all_edges(
             "{agent.name}" -> "{handoff.name}";""")
             parts.append(get_all_edges(handoff, agent, visited))
 
-    if not agent.handoffs and not isinstance(agent, Tool):  # type: ignore
+    if not agent.handoffs:
         parts.append(f'"{agent.name}" -> "__end__";')
 
     return "".join(parts)

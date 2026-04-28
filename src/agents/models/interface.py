@@ -36,6 +36,14 @@ class ModelTracing(enum.Enum):
 class Model(abc.ABC):
     """The base interface for calling an LLM."""
 
+    async def close(self) -> None:
+        """Release any resources held by the model.
+
+        Models that maintain persistent connections can override this. The default implementation
+        is a no-op.
+        """
+        return None
+
     @abc.abstractmethod
     async def get_response(
         self,
@@ -48,6 +56,7 @@ class Model(abc.ABC):
         tracing: ModelTracing,
         *,
         previous_response_id: str | None,
+        conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
         """Get a response from the model.
@@ -62,6 +71,7 @@ class Model(abc.ABC):
             tracing: Tracing configuration.
             previous_response_id: the ID of the previous response. Generally not used by the model,
                 except for the OpenAI Responses API.
+            conversation_id: The ID of the stored conversation, if any.
             prompt: The prompt config to use for the model.
 
         Returns:
@@ -81,6 +91,7 @@ class Model(abc.ABC):
         tracing: ModelTracing,
         *,
         previous_response_id: str | None,
+        conversation_id: str | None,
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         """Stream a response from the model.
@@ -95,6 +106,7 @@ class Model(abc.ABC):
             tracing: Tracing configuration.
             previous_response_id: the ID of the previous response. Generally not used by the model,
                 except for the OpenAI Responses API.
+            conversation_id: The ID of the stored conversation, if any.
             prompt: The prompt config to use for the model.
 
         Returns:
@@ -119,3 +131,11 @@ class ModelProvider(abc.ABC):
         Returns:
             The model.
         """
+
+    async def aclose(self) -> None:
+        """Release any resources held by the provider.
+
+        Providers that cache persistent models or network connections can override this. The
+        default implementation is a no-op.
+        """
+        return None

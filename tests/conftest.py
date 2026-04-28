@@ -18,6 +18,17 @@ def setup_span_processor():
     set_trace_processors([SPAN_PROCESSOR_TESTING])
 
 
+# Ensure a default OpenAI API key is present for tests that construct clients
+# without explicitly configuring a key/client. Tests that need no key use
+# monkeypatch.delenv("OPENAI_API_KEY", ...) to remove it locally.
+@pytest.fixture(scope="session", autouse=True)
+def ensure_openai_api_key():
+    import os
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = "test_key"
+
+
 # This fixture will run before each test
 @pytest.fixture(autouse=True)
 def clear_span_processor():
@@ -32,6 +43,7 @@ def clear_openai_settings():
     _openai_shared._default_openai_key = None
     _openai_shared._default_openai_client = None
     _openai_shared._use_responses_by_default = True
+    _openai_shared.set_default_openai_responses_transport("http")
 
 
 @pytest.fixture(autouse=True)

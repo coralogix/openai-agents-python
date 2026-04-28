@@ -5,6 +5,101 @@ The Agents SDK comes with out-of-the-box support for OpenAI models in two flavor
 -   **Recommended**: the [`OpenAIResponsesModel`][agents.models.openai_responses.OpenAIResponsesModel], which calls OpenAI APIs using the new [Responses API](https://platform.openai.com/docs/api-reference/responses).
 -   The [`OpenAIChatCompletionsModel`][agents.models.openai_chatcompletions.OpenAIChatCompletionsModel], which calls OpenAI APIs using the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat).
 
+## OpenAI models
+
+When you don't specify a model when initializing an `Agent`, the default model will be used. The default is currently [`gpt-4.1`](https://platform.openai.com/docs/models/gpt-4.1) for compatibility and low latency. If you have access, we recommend setting your agents to [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) for higher quality while keeping explicit `model_settings`.
+
+If you want to switch to other models like [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2), there are two ways to configure your agents.
+
+### Default model
+
+First, if you want to consistently use a specific model for all agents that do not set a custom model, set the `OPENAI_DEFAULT_MODEL` environment variable before running your agents.
+
+```bash
+export OPENAI_DEFAULT_MODEL=gpt-5.2
+python3 my_awesome_agent.py
+```
+
+Second, you can set a default model for a run via `RunConfig`. If you don't set a model for an agent, this run's model will be used.
+
+```python
+from agents import Agent, RunConfig, Runner
+
+agent = Agent(
+    name="Assistant",
+    instructions="You're a helpful agent.",
+)
+
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(model="gpt-5.2"),
+)
+```
+
+#### GPT-5.x models
+
+When you use any GPT-5.x model such as [`gpt-5.2`](https://platform.openai.com/docs/models/gpt-5.2) in this way, the SDK applies default `ModelSettings`. It sets the ones that work the best for most use cases. To adjust the reasoning effort for the default model, pass your own `ModelSettings`:
+
+```python
+from openai.types.shared import Reasoning
+from agents import Agent, ModelSettings
+
+my_agent = Agent(
+    name="My Agent",
+    instructions="You're a helpful agent.",
+    # If OPENAI_DEFAULT_MODEL=gpt-5.2 is set, passing only model_settings works.
+    # It's also fine to pass a GPT-5.x model name explicitly:
+    model="gpt-5.2",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="high"), verbosity="low")
+)
+```
+
+For lower latency, using `reasoning.effort="none"` with `gpt-5.2` is recommended. The gpt-4.1 family (including mini and nano variants) also remains a solid choice for building interactive agent apps.
+
+#### Non-GPT-5 models
+
+If you pass a non–GPT-5 model name without custom `model_settings`, the SDK reverts to generic `ModelSettings` compatible with any model.
+
+### Responses WebSocket transport
+
+By default, OpenAI Responses API requests use HTTP transport. You can opt in to websocket transport when using OpenAI-backed models.
+
+```python
+from agents import set_default_openai_responses_transport
+
+set_default_openai_responses_transport("websocket")
+```
+
+This affects OpenAI Responses models resolved by the default OpenAI provider (including string model names such as `"gpt-5.2"`).
+
+You can also configure websocket transport per provider or per run:
+
+```python
+from agents import Agent, OpenAIProvider, RunConfig, Runner
+
+provider = OpenAIProvider(
+    use_responses_websocket=True,
+    # Optional; if omitted, OPENAI_WEBSOCKET_BASE_URL is used when set.
+    websocket_base_url="wss://your-proxy.example/v1",
+)
+
+agent = Agent(name="Assistant")
+result = await Runner.run(
+    agent,
+    "Hello",
+    run_config=RunConfig(model_provider=provider),
+)
+```
+
+If you need prefix-based model routing (for example mixing `openai/...` and `litellm/...` model names in one run), use [`MultiProvider`][agents.MultiProvider] and set `openai_use_responses_websocket=True` there instead.
+
+Notes:
+
+-   This is the Responses API over websocket transport, not the [Realtime API](../realtime/guide.md).
+-   Install the `websockets` package if it is not already available in your environment.
+-   You can use [`Runner.run_streamed()`][agents.run.Runner.run_streamed] directly after enabling websocket transport. For multi-turn workflows where you want to reuse the same websocket connection across turns (and nested agent-as-tool calls), the [`responses_websocket_session()`][agents.responses_websocket_session] helper is recommended. See the [Running agents](../running_agents.md) guide and [`examples/basic/stream_ws.py`](https://github.com/openai/openai-agents-python/tree/main/examples/basic/stream_ws.py).
+
 ## Non-OpenAI models
 
 You can use most other non-OpenAI models via the [LiteLLM integration](./litellm.md). First, install the litellm dependency group:
@@ -53,14 +148,14 @@ import asyncio
 spanish_agent = Agent(
     name="Spanish agent",
     instructions="You only speak Spanish.",
-    model="o3-mini", # (1)!
+    model="gpt-5-mini", # (1)!
 )
 
 english_agent = Agent(
     name="English agent",
     instructions="You only speak English",
     model=OpenAIChatCompletionsModel( # (2)!
-        model="gpt-4o",
+        model="gpt-5-nano",
         openai_client=AsyncOpenAI()
     ),
 )
@@ -69,7 +164,7 @@ triage_agent = Agent(
     name="Triage agent",
     instructions="Handoff to the appropriate agent based on the language of the request.",
     handoffs=[spanish_agent, english_agent],
-    model="gpt-3.5-turbo",
+    model="gpt-5",
 )
 
 async def main():
@@ -88,8 +183,24 @@ from agents import Agent, ModelSettings
 english_agent = Agent(
     name="English agent",
     instructions="You only speak English",
-    model="gpt-4o",
+    model="gpt-4.1",
     model_settings=ModelSettings(temperature=0.1),
+)
+```
+
+Also, when you use OpenAI's Responses API, [there are a few other optional parameters](https://platform.openai.com/docs/api-reference/responses/create) (e.g., `user`, `service_tier`, and so on). If they are not available at the top level, you can use `extra_args` to pass them as well.
+
+```python
+from agents import Agent, ModelSettings
+
+english_agent = Agent(
+    name="English agent",
+    instructions="You only speak English",
+    model="gpt-4.1",
+    model_settings=ModelSettings(
+        temperature=0.1,
+        extra_args={"service_tier": "flex", "user": "user_12345"},
+    ),
 )
 ```
 

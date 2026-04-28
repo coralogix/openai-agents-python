@@ -7,11 +7,18 @@ from openai.types.responses.response_text_delta_event import ResponseTextDeltaEv
 from .agent import Agent
 from .items import TResponseInputItem
 from .result import RunResultBase
-from .run import Runner
+from .run import DEFAULT_MAX_TURNS, Runner
+from .run_context import TContext
 from .stream_events import AgentUpdatedStreamEvent, RawResponsesStreamEvent, RunItemStreamEvent
 
 
-async def run_demo_loop(agent: Agent[Any], *, stream: bool = True) -> None:
+async def run_demo_loop(
+    agent: Agent[Any],
+    *,
+    stream: bool = True,
+    context: TContext | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+) -> None:
     """Run a simple REPL loop with the given agent.
 
     This utility allows quick manual testing and debugging of an agent from the
@@ -21,6 +28,8 @@ async def run_demo_loop(agent: Agent[Any], *, stream: bool = True) -> None:
     Args:
         agent: The starting agent to run.
         stream: Whether to stream the agent output.
+        context: Additional context information to pass to the runner.
+        max_turns: Maximum number of turns for the runner to iterate.
     """
 
     current_agent = agent
@@ -40,7 +49,9 @@ async def run_demo_loop(agent: Agent[Any], *, stream: bool = True) -> None:
 
         result: RunResultBase
         if stream:
-            result = Runner.run_streamed(current_agent, input=input_items)
+            result = Runner.run_streamed(
+                current_agent, input=input_items, context=context, max_turns=max_turns
+            )
             async for event in result.stream_events():
                 if isinstance(event, RawResponsesStreamEvent):
                     if isinstance(event.data, ResponseTextDeltaEvent):
@@ -54,7 +65,9 @@ async def run_demo_loop(agent: Agent[Any], *, stream: bool = True) -> None:
                     print(f"\n[Agent updated: {event.new_agent.name}]", flush=True)
             print()
         else:
-            result = await Runner.run(current_agent, input_items)
+            result = await Runner.run(
+                current_agent, input_items, context=context, max_turns=max_turns
+            )
             if result.final_output is not None:
                 print(result.final_output)
 
