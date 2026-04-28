@@ -1,7 +1,5 @@
-import atexit
-
-from agents.tracing.provider import DefaultTraceProvider, TraceProvider
-
+from .config import TracingConfig
+from .context import TraceCtxManager
 from .create import (
     agent_span,
     custom_span,
@@ -19,7 +17,8 @@ from .create import (
     transcription_span,
 )
 from .processor_interface import TracingProcessor
-from .processors import default_exporter, default_processor
+from .processors import default_exporter
+from .provider import TraceProvider
 from .setup import get_trace_provider, set_trace_provider
 from .span_data import (
     AgentSpanData,
@@ -54,6 +53,8 @@ __all__ = [
     "set_trace_processors",
     "set_trace_provider",
     "set_tracing_disabled",
+    "TracingConfig",
+    "TraceCtxManager",
     "trace",
     "Trace",
     "SpanError",
@@ -107,13 +108,3 @@ def set_tracing_export_api_key(api_key: str) -> None:
     Set the OpenAI API key for the backend exporter.
     """
     default_exporter().set_api_key(api_key)
-
-
-set_trace_provider(DefaultTraceProvider())
-# Add the default processor, which exports traces and spans to the backend in batches. You can
-# change the default behavior by either:
-# 1. calling add_trace_processor(), which adds additional processors, or
-# 2. calling set_trace_processors(), which replaces the default processor.
-add_trace_processor(default_processor())
-
-atexit.register(get_trace_provider().shutdown)

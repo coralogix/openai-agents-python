@@ -39,7 +39,7 @@ By default, the SDK traces the following:
 -   Audio outputs (text-to-speech) are wrapped in a `speech_span()`
 -   Related audio spans may be parented under a `speech_group_span()`
 
-By default, the trace is named "Agent trace". You can set this name if you use `trace`, or you can can configure the name and other properties with the [`RunConfig`][agents.run.RunConfig].
+By default, the trace is named "Agent workflow". You can set this name if you use `trace`, or you can configure the name and other properties with the [`RunConfig`][agents.run.RunConfig].
 
 In addition, you can set up [custom trace processors](#custom-tracing-processors) to push traces to other destinations (as a replacement, or secondary destination).
 
@@ -85,6 +85,8 @@ The `generation_span()` stores the inputs/outputs of the LLM generation, and `fu
 
 Similarly, Audio spans include base64-encoded PCM data for input and output audio by default. You can disable capturing this audio data by configuring [`VoicePipelineConfig.trace_include_sensitive_audio_data`][agents.voice.pipeline_config.VoicePipelineConfig.trace_include_sensitive_audio_data].
 
+By default, `trace_include_sensitive_data` is `True`. You can set the default without code by exporting the `OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA` environment variable to `true/1` or `false/0` before running your app.
+
 ## Custom tracing processors
 
 The high level architecture for tracing is:
@@ -97,13 +99,53 @@ To customize this default setup, to send traces to alternative or additional bac
 1. [`add_trace_processor()`][agents.tracing.add_trace_processor] lets you add an **additional** trace processor that will receive traces and spans as they are ready. This lets you do your own processing in addition to sending traces to OpenAI's backend.
 2. [`set_trace_processors()`][agents.tracing.set_trace_processors] lets you **replace** the default processors with your own trace processors. This means traces will not be sent to the OpenAI backend unless you include a `TracingProcessor` that does so.
 
+
+## Tracing with Non-OpenAI Models
+
+You can use an OpenAI API key with non-OpenAI Models to enable free tracing in the OpenAI Traces dashboard without needing to disable tracing.
+
+```python
+import os
+from agents import set_tracing_export_api_key, Agent, Runner
+from agents.extensions.models.litellm_model import LitellmModel
+
+tracing_api_key = os.environ["OPENAI_API_KEY"]
+set_tracing_export_api_key(tracing_api_key)
+
+model = LitellmModel(
+    model="your-model-name",
+    api_key="your-api-key",
+)
+
+agent = Agent(
+    name="Assistant",
+    model=model,
+)
+```
+
+If you only need a different tracing key for a single run, pass it via `RunConfig` instead of changing the global exporter.
+
+```python
+from agents import Runner, RunConfig
+
+await Runner.run(
+    agent,
+    input="Hello",
+    run_config=RunConfig(tracing={"api_key": "sk-tracing-123"}),
+)
+```
+
+## Notes
+- View free traces at Openai Traces dashboard.
+
+
 ## External tracing processors list
 
 -   [Weights & Biases](https://weave-docs.wandb.ai/guides/integrations/openai_agents)
 -   [Arize-Phoenix](https://docs.arize.com/phoenix/tracing/integrations-tracing/openai-agents-sdk)
 -   [Future AGI](https://docs.futureagi.com/future-agi/products/observability/auto-instrumentation/openai_agents)
--   [MLflow (self-hosted/OSS](https://mlflow.org/docs/latest/tracing/integrations/openai-agent)
--   [MLflow (Databricks hosted](https://docs.databricks.com/aws/en/mlflow/mlflow-tracing#-automatic-tracing)
+-   [MLflow (self-hosted/OSS)](https://mlflow.org/docs/latest/tracing/integrations/openai-agent)
+-   [MLflow (Databricks hosted)](https://docs.databricks.com/aws/en/mlflow/mlflow-tracing#-automatic-tracing)
 -   [Braintrust](https://braintrust.dev/docs/guides/traces/integrations#openai-agents-sdk)
 -   [Pydantic Logfire](https://logfire.pydantic.dev/docs/integrations/llms/openai/#openai-agents)
 -   [AgentOps](https://docs.agentops.ai/v1/integrations/agentssdk)
@@ -117,3 +159,7 @@ To customize this default setup, to send traces to alternative or additional bac
 -   [Okahu-Monocle](https://github.com/monocle2ai/monocle)
 -   [Galileo](https://v2docs.galileo.ai/integrations/openai-agent-integration#openai-agent-integration)
 -   [Portkey AI](https://portkey.ai/docs/integrations/agents/openai-agents)
+-   [LangDB AI](https://docs.langdb.ai/getting-started/working-with-agent-frameworks/working-with-openai-agents-sdk)
+-   [Agenta](https://docs.agenta.ai/observability/integrations/openai-agents)
+-   [PostHog](https://posthog.com/docs/llm-analytics/installation/openai-agents)
+-   [Traccia](https://traccia.ai/docs/integrations/openai-agents)

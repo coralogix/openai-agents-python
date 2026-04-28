@@ -1,4 +1,5 @@
 try:
+    from .manager import MCPServerManager
     from .server import (
         MCPServer,
         MCPServerSse,
@@ -11,7 +12,16 @@ try:
 except ImportError:
     pass
 
-from .util import MCPUtil
+from .util import (
+    MCPToolMetaContext,
+    MCPToolMetaResolver,
+    MCPUtil,
+    ToolFilter,
+    ToolFilterCallable,
+    ToolFilterContext,
+    ToolFilterStatic,
+    create_static_tool_filter,
+)
 
 __all__ = [
     "MCPServer",
@@ -21,5 +31,13 @@ __all__ = [
     "MCPServerStdioParams",
     "MCPServerStreamableHttp",
     "MCPServerStreamableHttpParams",
+    "MCPServerManager",
     "MCPUtil",
+    "MCPToolMetaContext",
+    "MCPToolMetaResolver",
+    "ToolFilter",
+    "ToolFilterCallable",
+    "ToolFilterContext",
+    "ToolFilterStatic",
+    "create_static_tool_filter",
 ]

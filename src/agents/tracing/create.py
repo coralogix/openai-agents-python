@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ..logger import logger
+from .config import TracingConfig
 from .setup import get_trace_provider
 from .span_data import (
     AgentSpanData,
@@ -30,6 +31,7 @@ def trace(
     trace_id: str | None = None,
     group_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    tracing: TracingConfig | None = None,
     disabled: bool = False,
 ) -> Trace:
     """
@@ -50,8 +52,8 @@ def trace(
         group_id: Optional grouping identifier to link multiple traces from the same conversation
             or process. For instance, you might use a chat thread ID.
         metadata: Optional dictionary of additional metadata to attach to the trace.
-        disabled: If True, we will return a Trace but the Trace will not be recorded. This will
-            not be checked if there's an existing trace and `even_if_trace_running` is True.
+        tracing: Optional tracing configuration for exporting this trace.
+        disabled: If True, we will return a Trace but the Trace will not be recorded.
 
     Returns:
         The newly created trace object.
@@ -67,6 +69,7 @@ def trace(
         trace_id=trace_id,
         group_id=group_id,
         metadata=metadata,
+        tracing=tracing,
         disabled=disabled,
     )
 

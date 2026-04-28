@@ -1,3 +1,4 @@
+import inspect
 import json
 from typing import Any
 
@@ -15,7 +16,7 @@ from agents import (
     UserError,
     handoff,
 )
-from agents.run import AgentRunner
+from agents.run_internal.run_loop import get_handoffs
 
 
 def message_item(content: str, agent: Agent[Any]) -> MessageOutputItem:
@@ -26,7 +27,9 @@ def message_item(content: str, agent: Agent[Any]) -> MessageOutputItem:
             status="completed",
             role="assistant",
             type="message",
-            content=[ResponseOutputText(text=content, type="output_text", annotations=[])],
+            content=[
+                ResponseOutputText(text=content, type="output_text", annotations=[], logprobs=[])
+            ],
         ),
     )
 
@@ -46,9 +49,9 @@ async def test_single_handoff_setup():
     assert not agent_1.handoffs
     assert agent_2.handoffs == [agent_1]
 
-    assert not (await AgentRunner._get_handoffs(agent_1, RunContextWrapper(agent_1)))
+    assert not (await get_handoffs(agent_1, RunContextWrapper(agent_1)))
 
-    handoff_objects = await AgentRunner._get_handoffs(agent_2, RunContextWrapper(agent_2))
+    handoff_objects = await get_handoffs(agent_2, RunContextWrapper(agent_2))
     assert len(handoff_objects) == 1
     obj = handoff_objects[0]
     assert obj.tool_name == Handoff.default_tool_name(agent_1)
@@ -66,7 +69,7 @@ async def test_multiple_handoffs_setup():
     assert not agent_1.handoffs
     assert not agent_2.handoffs
 
-    handoff_objects = await AgentRunner._get_handoffs(agent_3, RunContextWrapper(agent_3))
+    handoff_objects = await get_handoffs(agent_3, RunContextWrapper(agent_3))
     assert len(handoff_objects) == 2
     assert handoff_objects[0].tool_name == Handoff.default_tool_name(agent_1)
     assert handoff_objects[1].tool_name == Handoff.default_tool_name(agent_2)
@@ -98,7 +101,7 @@ async def test_custom_handoff_setup():
     assert not agent_1.handoffs
     assert not agent_2.handoffs
 
-    handoff_objects = await AgentRunner._get_handoffs(agent_3, RunContextWrapper(agent_3))
+    handoff_objects = await get_handoffs(agent_3, RunContextWrapper(agent_3))
     assert len(handoff_objects) == 2
 
     first_handoff = handoff_objects[0]
@@ -220,6 +223,7 @@ def test_handoff_input_data():
         input_history="",
         pre_handoff_items=(),
         new_items=(),
+        run_context=RunContextWrapper(context=()),
     )
     assert get_len(data) == 1
 
@@ -227,6 +231,7 @@ def test_handoff_input_data():
         input_history=({"role": "user", "content": "foo"},),
         pre_handoff_items=(),
         new_items=(),
+        run_context=RunContextWrapper(context=()),
     )
     assert get_len(data) == 1
 
@@ -237,6 +242,7 @@ def test_handoff_input_data():
         ),
         pre_handoff_items=(),
         new_items=(),
+        run_context=RunContextWrapper(context=()),
     )
     assert get_len(data) == 2
 
@@ -250,6 +256,7 @@ def test_handoff_input_data():
             message_item("bar", agent),
             message_item("baz", agent),
         ),
+        run_context=RunContextWrapper(context=()),
     )
     assert get_len(data) == 5
 
@@ -263,6 +270,7 @@ def test_handoff_input_data():
             message_item("baz", agent),
             message_item("qux", agent),
         ),
+        run_context=RunContextWrapper(context=()),
     )
 
     assert get_len(data) == 5
@@ -318,6 +326,8 @@ async def test_handoff_is_enabled_callable():
     handoff_callable_enabled = handoff(agent, is_enabled=always_enabled)
     assert callable(handoff_callable_enabled.is_enabled)
     result = handoff_callable_enabled.is_enabled(RunContextWrapper(agent), agent)
+    assert inspect.isawaitable(result)
+    result = await result
     assert result is True
 
     # Test callable that returns False
@@ -327,6 +337,8 @@ async def test_handoff_is_enabled_callable():
     handoff_callable_disabled = handoff(agent, is_enabled=always_disabled)
     assert callable(handoff_callable_disabled.is_enabled)
     result = handoff_callable_disabled.is_enabled(RunContextWrapper(agent), agent)
+    assert inspect.isawaitable(result)
+    result = await result
     assert result is False
 
     # Test async callable
@@ -361,7 +373,7 @@ async def test_handoff_is_enabled_filtering_integration():
     context_wrapper = RunContextWrapper(main_agent)
 
     # Get filtered handoffs using the runner's method
-    filtered_handoffs = await AgentRunner._get_handoffs(main_agent, context_wrapper)
+    filtered_handoffs = await get_handoffs(main_agent, context_wrapper)
 
     # Should only have 2 handoffs (agent_1 and agent_3), agent_2 should be filtered out
     assert len(filtered_handoffs) == 2

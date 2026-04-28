@@ -1,10 +1,11 @@
-"""Unit tests for the ComputerAction methods in `agents._run_impl`.
+"""Unit tests for the ComputerAction methods in `agents.run_internal.run_loop`.
 
 These confirm that the correct computer action method is invoked for each action type and
 that screenshots are taken and wrapped appropriately, and that the execute function invokes
 hooks and returns the expected ToolCallOutputItem."""
 
-from typing import Any
+import json
+from typing import Any, cast
 
 import pytest
 from openai.types.responses.response_computer_tool_call import (
@@ -18,6 +19,7 @@ from openai.types.responses.response_computer_tool_call import (
     ActionScroll,
     ActionType,
     ActionWait,
+    PendingSafetyCheck,
     ResponseComputerToolCall,
 )
 
@@ -30,9 +32,28 @@ from agents import (
     RunConfig,
     RunContextWrapper,
     RunHooks,
+    set_tracing_disabled,
+    trace,
 )
-from agents._run_impl import ComputerAction, ToolRunComputerAction
 from agents.items import ToolCallOutputItem
+from agents.run_internal import run_loop
+from agents.run_internal.run_loop import ComputerAction, ToolRunComputerAction
+from agents.tool import ComputerToolSafetyCheckData
+
+from .testing_processor import SPAN_PROCESSOR_TESTING
+
+
+def _get_function_span(tool_name: str) -> dict[str, Any]:
+    for span in SPAN_PROCESSOR_TESTING.get_ordered_spans(including_empty=True):
+        exported = span.export()
+        if not exported:
+            continue
+        span_data = exported.get("span_data")
+        if not isinstance(span_data, dict):
+            continue
+        if span_data.get("type") == "function" and span_data.get("name") == tool_name:
+            return exported
+    raise AssertionError(f"Function span for tool '{tool_name}' not found")
 
 
 class LoggingComputer(Computer):
@@ -158,7 +179,7 @@ async def test_get_screenshot_sync_executes_action_and_takes_screenshot(
         pending_safety_checks=[],
         status="completed",
     )
-    screenshot_output = await ComputerAction._get_screenshot_sync(computer, tool_call)
+    screenshot_output = await ComputerAction._execute_action_and_capture(computer, tool_call)
     # The last call is always to screenshot()
     if isinstance(action, ActionScreenshot):
         # Screenshot is taken twice: initial explicit call plus final capture.
@@ -205,7 +226,7 @@ async def test_get_screenshot_async_executes_action_and_takes_screenshot(
         pending_safety_checks=[],
         status="completed",
     )
-    screenshot_output = await ComputerAction._get_screenshot_async(computer, tool_call)
+    screenshot_output = await ComputerAction._execute_action_and_capture(computer, tool_call)
     if isinstance(action, ActionScreenshot):
         assert computer.calls == [("screenshot", ()), ("screenshot", ())]
     else:
@@ -302,10 +323,128 @@ async def test_execute_invokes_hooks_and_returns_tool_call_output() -> None:
     assert output_item.agent is agent
     assert isinstance(output_item, ToolCallOutputItem)
     assert output_item.output == "data:image/png;base64,xyz"
-    raw = output_item.raw_item
+    raw = cast(dict[str, Any], output_item.raw_item)
     # Raw item is a dict-like mapping with expected output fields.
-    assert isinstance(raw, dict)
     assert raw["type"] == "computer_call_output"
     assert raw["output"]["type"] == "computer_screenshot"
     assert "image_url" in raw["output"]
     assert raw["output"]["image_url"].endswith("xyz")
+
+
+@pytest.mark.asyncio
+async def test_execute_emits_function_span() -> None:
+    computer = LoggingComputer(screenshot_return="trace_img")
+    comptool = ComputerTool(computer=computer)
+    tool_call = ResponseComputerToolCall(
+        id="tool_trace",
+        type="computer_call",
+        action=ActionScreenshot(type="screenshot"),
+        call_id="tool_trace",
+        pending_safety_checks=[],
+        status="completed",
+    )
+    tool_run = ToolRunComputerAction(tool_call=tool_call, computer_tool=comptool)
+    agent = Agent(name="test_agent_trace", tools=[comptool])
+
+    set_tracing_disabled(False)
+    with trace("computer-span-test"):
+        result = await ComputerAction.execute(
+            agent=agent,
+            action=tool_run,
+            hooks=RunHooks[Any](),
+            context_wrapper=RunContextWrapper(context=None),
+            config=RunConfig(),
+        )
+
+    assert isinstance(result, ToolCallOutputItem)
+    function_span = _get_function_span(comptool.name)
+    span_data = cast(dict[str, Any], function_span["span_data"])
+    assert span_data.get("input") is not None
+    assert cast(str, span_data.get("output", "")).startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_execute_redacts_span_error_when_sensitive_data_disabled() -> None:
+    secret_error = "computer secret output"
+
+    class FailingComputer(LoggingComputer):
+        def screenshot(self) -> str:
+            raise RuntimeError(secret_error)
+
+    computer = FailingComputer()
+    comptool = ComputerTool(computer=computer)
+    tool_call = ResponseComputerToolCall(
+        id="tool_trace_error",
+        type="computer_call",
+        action=ActionScreenshot(type="screenshot"),
+        call_id="tool_trace_error",
+        pending_safety_checks=[],
+        status="completed",
+    )
+    tool_run = ToolRunComputerAction(tool_call=tool_call, computer_tool=comptool)
+    agent = Agent(name="test_agent_trace_error", tools=[comptool])
+
+    set_tracing_disabled(False)
+    with trace("computer-span-redaction-test"):
+        with pytest.raises(RuntimeError, match=secret_error):
+            await ComputerAction.execute(
+                agent=agent,
+                action=tool_run,
+                hooks=RunHooks[Any](),
+                context_wrapper=RunContextWrapper(context=None),
+                config=RunConfig(trace_include_sensitive_data=False),
+            )
+
+    function_span = _get_function_span(comptool.name)
+    assert function_span.get("error") == {
+        "message": "Error running tool",
+        "data": {
+            "tool_name": comptool.name,
+            "error": "Tool execution failed. Error details are redacted.",
+        },
+    }
+    assert secret_error not in json.dumps(function_span)
+    span_data = cast(dict[str, Any], function_span["span_data"])
+    assert span_data.get("input") is None
+    assert span_data.get("output") is None
+
+
+@pytest.mark.asyncio
+async def test_pending_safety_check_acknowledged() -> None:
+    """Safety checks should be acknowledged via the callback."""
+
+    computer = LoggingComputer(screenshot_return="img")
+    called: list[ComputerToolSafetyCheckData] = []
+
+    def on_sc(data: ComputerToolSafetyCheckData) -> bool:
+        called.append(data)
+        return True
+
+    tool = ComputerTool(computer=computer, on_safety_check=on_sc)
+    safety = PendingSafetyCheck(id="sc", code="c", message="m")
+    tool_call = ResponseComputerToolCall(
+        id="t1",
+        type="computer_call",
+        action=ActionClick(type="click", x=1, y=1, button="left"),
+        call_id="t1",
+        pending_safety_checks=[safety],
+        status="completed",
+    )
+    run_action = ToolRunComputerAction(tool_call=tool_call, computer_tool=tool)
+    agent = Agent(name="a", tools=[tool])
+    ctx = RunContextWrapper(context=None)
+
+    results = await run_loop.execute_computer_actions(
+        agent=agent,
+        actions=[run_action],
+        hooks=RunHooks[Any](),
+        context_wrapper=ctx,
+        config=RunConfig(),
+    )
+
+    assert len(results) == 1
+    raw = results[0].raw_item
+    assert isinstance(raw, dict)
+    assert raw.get("acknowledged_safety_checks") == [{"id": "sc", "code": "c", "message": "m"}]
+    assert len(called) == 1
+    assert called[0].safety_check.id == "sc"

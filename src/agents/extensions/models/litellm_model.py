@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import AsyncIterator
+from copy import copy
 from typing import Any, Literal, cast, overload
 
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
@@ -17,15 +19,21 @@ except ImportError as _e:
         "dependency group: `pip install 'openai-agents[litellm]'`."
     ) from _e
 
-from openai import NOT_GIVEN, AsyncStream, NotGiven
-from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageToolCall
+from openai import AsyncStream, NotGiven, omit
+from openai.types.chat import (
+    ChatCompletionChunk,
+    ChatCompletionMessageCustomToolCall,
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageParam,
+)
 from openai.types.chat.chat_completion_message import (
     Annotation,
     AnnotationURLCitation,
     ChatCompletionMessage,
 )
-from openai.types.chat.chat_completion_message_tool_call import Function
+from openai.types.chat.chat_completion_message_function_tool_call import Function
 from openai.types.responses import Response
+from pydantic import BaseModel
 
 from ... import _debug
 from ...agent_output import AgentOutputSchemaBase
@@ -34,15 +42,94 @@ from ...items import ModelResponse, TResponseInputItem, TResponseStreamEvent
 from ...logger import logger
 from ...model_settings import ModelSettings
 from ...models.chatcmpl_converter import Converter
-from ...models.chatcmpl_helpers import HEADERS
+from ...models.chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
 from ...models.fake_id import FAKE_RESPONSES_ID
 from ...models.interface import Model, ModelTracing
+from ...models.openai_responses import Converter as OpenAIResponsesConverter
 from ...tool import Tool
 from ...tracing import generation_span
 from ...tracing.span_data import GenerationSpanData
 from ...tracing.spans import Span
 from ...usage import Usage
+from ...util._json import _to_dump_compatible
+
+
+def _patch_litellm_serializer_warnings() -> None:
+    """Ensure LiteLLM logging uses model_dump(warnings=False) when available."""
+    # Background: LiteLLM emits Pydantic serializer warnings for Message/Choices mismatches.
+    # See: https://github.com/BerriAI/litellm/issues/11759
+    # This patch relies on a private LiteLLM helper; if the name or signature changes,
+    # the wrapper should no-op or fall back to LiteLLM's default behavior. Revisit on upgrade.
+    # Remove this patch once the LiteLLM issue is resolved.
+
+    try:
+        from litellm.litellm_core_utils import litellm_logging as _litellm_logging
+    except Exception:
+        return
+
+    # Guard against double-patching if this module is imported multiple times.
+    if getattr(_litellm_logging, "_openai_agents_patched_serializer_warnings", False):
+        return
+
+    original = getattr(_litellm_logging, "_extract_response_obj_and_hidden_params", None)
+    if original is None:
+        return
+
+    def _wrapped_extract_response_obj_and_hidden_params(*args, **kwargs):
+        # init_response_obj is LiteLLM's raw response container (often a Pydantic BaseModel).
+        # Accept arbitrary args to stay compatible if LiteLLM changes the signature.
+        init_response_obj = args[0] if args else kwargs.get("init_response_obj")
+        if isinstance(init_response_obj, BaseModel):
+            hidden_params = getattr(init_response_obj, "_hidden_params", None)
+            try:
+                response_obj = init_response_obj.model_dump(warnings=False)
+            except TypeError:
+                response_obj = init_response_obj.model_dump()
+            if args:
+                response_obj_out, original_hidden = original(response_obj, *args[1:], **kwargs)
+            else:
+                updated_kwargs = dict(kwargs)
+                updated_kwargs["init_response_obj"] = response_obj
+                response_obj_out, original_hidden = original(**updated_kwargs)
+            return response_obj_out, hidden_params or original_hidden
+
+        return original(*args, **kwargs)
+
+    setattr(  # noqa: B010
+        _litellm_logging,
+        "_extract_response_obj_and_hidden_params",
+        _wrapped_extract_response_obj_and_hidden_params,
+    )
+    setattr(  # noqa: B010
+        _litellm_logging,
+        "_openai_agents_patched_serializer_warnings",
+        True,
+    )
+
+
+# Set OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH=true to opt in.
+_enable_litellm_patch = os.getenv("OPENAI_AGENTS_ENABLE_LITELLM_SERIALIZER_PATCH", "")
+if _enable_litellm_patch.lower() in ("1", "true"):
+    _patch_litellm_serializer_warnings()
+
+
+class InternalChatCompletionMessage(ChatCompletionMessage):
+    """
+    An internal subclass to carry reasoning_content and thinking_blocks without modifying the original model.
+    """  # noqa: E501
+
+    reasoning_content: str
+    thinking_blocks: list[dict[str, Any]] | None = None
+
+
+class InternalToolCall(ChatCompletionMessageFunctionToolCall):
+    """
+    An internal subclass to carry provider-specific metadata (e.g., Gemini thought signatures)
+    without modifying the original model.
+    """
+
+    extra_content: dict[str, Any] | None = None
 
 
 class LitellmModel(Model):
@@ -70,7 +157,8 @@ class LitellmModel(Model):
         output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
-        previous_response_id: str | None,
+        previous_response_id: str | None = None,  # unused
+        conversation_id: str | None = None,  # unused
         prompt: Any | None = None,
     ) -> ModelResponse:
         with generation_span(
@@ -92,14 +180,26 @@ class LitellmModel(Model):
                 prompt=prompt,
             )
 
-            assert isinstance(response.choices[0], litellm.types.utils.Choices)
+            message: litellm.types.utils.Message | None = None
+            first_choice: litellm.types.utils.Choices | None = None
+            if response.choices and len(response.choices) > 0:
+                choice = response.choices[0]
+                if isinstance(choice, litellm.types.utils.Choices):
+                    first_choice = choice
+                    message = first_choice.message
 
             if _debug.DONT_LOG_MODEL_DATA:
                 logger.debug("Received model response")
             else:
-                logger.debug(
-                    f"LLM resp:\n{json.dumps(response.choices[0].message.model_dump(), indent=2)}\n"
-                )
+                if message is not None:
+                    logger.debug(
+                        f"""LLM resp:\n{
+                            json.dumps(message.model_dump(), indent=2, ensure_ascii=False)
+                        }\n"""
+                    )
+                else:
+                    finish_reason = first_choice.finish_reason if first_choice else "-"
+                    logger.debug(f"LLM resp had no message. finish_reason: {finish_reason}")
 
             if hasattr(response, "usage"):
                 response_usage = response.usage
@@ -130,14 +230,30 @@ class LitellmModel(Model):
                 logger.warning("No usage information returned from Litellm")
 
             if tracing.include_data():
-                span_generation.span_data.output = [response.choices[0].message.model_dump()]
+                span_generation.span_data.output = (
+                    [message.model_dump()] if message is not None else []
+                )
             span_generation.span_data.usage = {
+                "requests": usage.requests,
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+                "input_tokens_details": usage.input_tokens_details.model_dump(),
+                "output_tokens_details": usage.output_tokens_details.model_dump(),
             }
 
-            items = Converter.message_to_output_items(
-                LitellmConverter.convert_message_to_openai(response.choices[0].message)
+            # Build provider_data for provider specific fields
+            provider_data: dict[str, Any] = {"model": self.model}
+            if message is not None and hasattr(response, "id"):
+                provider_data["response_id"] = response.id
+
+            items = (
+                Converter.message_to_output_items(
+                    LitellmConverter.convert_message_to_openai(message, model=self.model),
+                    provider_data=provider_data,
+                )
+                if message is not None
+                else []
             )
 
             return ModelResponse(
@@ -155,7 +271,8 @@ class LitellmModel(Model):
         output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
-        previous_response_id: str | None,
+        previous_response_id: str | None = None,  # unused
+        conversation_id: str | None = None,  # unused
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         with generation_span(
@@ -178,7 +295,9 @@ class LitellmModel(Model):
             )
 
             final_response: Response | None = None
-            async for chunk in ChatCmplStreamHandler.handle_stream(response, stream):
+            async for chunk in ChatCmplStreamHandler.handle_stream(
+                response, stream, model=self.model
+            ):
                 yield chunk
 
                 if chunk.type == "response.completed":
@@ -189,8 +308,20 @@ class LitellmModel(Model):
 
             if final_response and final_response.usage:
                 span_generation.span_data.usage = {
+                    "requests": 1,
                     "input_tokens": final_response.usage.input_tokens,
                     "output_tokens": final_response.usage.output_tokens,
+                    "total_tokens": final_response.usage.total_tokens,
+                    "input_tokens_details": (
+                        final_response.usage.input_tokens_details.model_dump()
+                        if final_response.usage.input_tokens_details
+                        else {"cached_tokens": 0}
+                    ),
+                    "output_tokens_details": (
+                        final_response.usage.output_tokens_details.model_dump()
+                        if final_response.usage.output_tokens_details
+                        else {"reasoning_tokens": 0}
+                    ),
                 }
 
     @overload
@@ -236,7 +367,29 @@ class LitellmModel(Model):
         stream: bool = False,
         prompt: Any | None = None,
     ) -> litellm.types.utils.ModelResponse | tuple[Response, AsyncStream[ChatCompletionChunk]]:
-        converted_messages = Converter.items_to_messages(input)
+        # Preserve reasoning messages for tool calls when reasoning is on
+        # This is needed for models like Claude 4 Sonnet/Opus which support interleaved thinking
+        preserve_thinking_blocks = (
+            model_settings.reasoning is not None and model_settings.reasoning.effort is not None
+        )
+
+        converted_messages = Converter.items_to_messages(
+            input,
+            preserve_thinking_blocks=preserve_thinking_blocks,
+            preserve_tool_output_all_content=True,
+            model=self.model,
+        )
+
+        # Fix message ordering: reorder to ensure tool_use comes before tool_result.
+        # Required for Anthropic and Vertex AI Gemini APIs which reject tool responses without preceding tool calls.  # noqa: E501
+        if any(model.lower() in self.model.lower() for model in ["anthropic", "claude", "gemini"]):
+            converted_messages = self._fix_tool_message_ordering(converted_messages)
+
+        # Convert Google's extra_content to litellm's provider_specific_fields format
+        if "gemini" in self.model.lower():
+            converted_messages = self._convert_gemini_extra_content_to_provider_specific_fields(
+                converted_messages
+            )
 
         if system_instructions:
             converted_messages.insert(
@@ -246,6 +399,8 @@ class LitellmModel(Model):
                     "role": "system",
                 },
             )
+        converted_messages = _to_dump_compatible(converted_messages)
+
         if tracing.include_data():
             span.span_data.input = converted_messages
 
@@ -264,19 +419,61 @@ class LitellmModel(Model):
         for handoff in handoffs:
             converted_tools.append(Converter.convert_handoff_tool(handoff))
 
+        converted_tools = _to_dump_compatible(converted_tools)
+
         if _debug.DONT_LOG_MODEL_DATA:
             logger.debug("Calling LLM")
         else:
+            messages_json = json.dumps(
+                converted_messages,
+                indent=2,
+                ensure_ascii=False,
+            )
+            tools_json = json.dumps(
+                converted_tools,
+                indent=2,
+                ensure_ascii=False,
+            )
             logger.debug(
                 f"Calling Litellm model: {self.model}\n"
-                f"{json.dumps(converted_messages, indent=2)}\n"
-                f"Tools:\n{json.dumps(converted_tools, indent=2)}\n"
+                f"{messages_json}\n"
+                f"Tools:\n{tools_json}\n"
                 f"Stream: {stream}\n"
                 f"Tool choice: {tool_choice}\n"
                 f"Response format: {response_format}\n"
             )
 
-        reasoning_effort = model_settings.reasoning.effort if model_settings.reasoning else None
+        # Build reasoning_effort - use dict only when summary is present (OpenAI feature)
+        # Otherwise pass string for backward compatibility with all providers
+        reasoning_effort: dict[str, Any] | str | None = None
+        if model_settings.reasoning:
+            if model_settings.reasoning.summary is not None:
+                # Dict format when summary is needed (OpenAI only)
+                reasoning_effort = {
+                    "effort": model_settings.reasoning.effort,
+                    "summary": model_settings.reasoning.summary,
+                }
+            elif model_settings.reasoning.effort is not None:
+                # String format for compatibility with all providers
+                reasoning_effort = model_settings.reasoning.effort
+
+        # Enable developers to pass non-OpenAI compatible reasoning_effort data like "none"
+        # Priority order:
+        #  1. model_settings.reasoning (effort + summary)
+        #  2. model_settings.extra_body["reasoning_effort"]
+        #  3. model_settings.extra_args["reasoning_effort"]
+        if (
+            reasoning_effort is None  # Unset in model_settings
+            and isinstance(model_settings.extra_body, dict)
+            and "reasoning_effort" in model_settings.extra_body
+        ):
+            reasoning_effort = model_settings.extra_body["reasoning_effort"]
+        if (
+            reasoning_effort is None  # Unset in both model_settings and model_settings.extra_body
+            and model_settings.extra_args
+            and "reasoning_effort" in model_settings.extra_args
+        ):
+            reasoning_effort = model_settings.extra_args["reasoning_effort"]
 
         stream_options = None
         if stream and model_settings.include_usage is not None:
@@ -284,15 +481,18 @@ class LitellmModel(Model):
 
         extra_kwargs = {}
         if model_settings.extra_query:
-            extra_kwargs["extra_query"] = model_settings.extra_query
+            extra_kwargs["extra_query"] = copy(model_settings.extra_query)
         if model_settings.metadata:
-            extra_kwargs["metadata"] = model_settings.metadata
+            extra_kwargs["metadata"] = copy(model_settings.metadata)
         if model_settings.extra_body and isinstance(model_settings.extra_body, dict):
             extra_kwargs.update(model_settings.extra_body)
 
         # Add kwargs from model_settings.extra_args, filtering out None values
         if model_settings.extra_args:
             extra_kwargs.update(model_settings.extra_args)
+
+        # Prevent duplicate reasoning_effort kwargs when it was promoted to a top-level argument.
+        extra_kwargs.pop("reasoning_effort", None)
 
         ret = await litellm.acompletion(
             model=self.model,
@@ -309,7 +509,8 @@ class LitellmModel(Model):
             stream=stream,
             stream_options=stream_options,
             reasoning_effort=reasoning_effort,
-            extra_headers={**HEADERS, **(model_settings.extra_headers or {})},
+            top_logprobs=model_settings.top_logprobs,
+            extra_headers=self._merge_headers(model_settings),
             api_key=self.api_key,
             base_url=self.base_url,
             **extra_kwargs,
@@ -318,15 +519,19 @@ class LitellmModel(Model):
         if isinstance(ret, litellm.types.utils.ModelResponse):
             return ret
 
+        responses_tool_choice = OpenAIResponsesConverter.convert_tool_choice(
+            model_settings.tool_choice
+        )
+        if responses_tool_choice is None or responses_tool_choice is omit:
+            responses_tool_choice = "auto"
+
         response = Response(
             id=FAKE_RESPONSES_ID,
             created_at=time.time(),
             model=self.model,
             object="response",
             output=[],
-            tool_choice=cast(Literal["auto", "required", "none"], tool_choice)
-            if tool_choice != NOT_GIVEN
-            else "auto",
+            tool_choice=responses_tool_choice,  # type: ignore[arg-type]
             top_p=model_settings.top_p,
             temperature=model_settings.temperature,
             tools=[],
@@ -335,22 +540,212 @@ class LitellmModel(Model):
         )
         return response, ret
 
+    def _convert_gemini_extra_content_to_provider_specific_fields(
+        self, messages: list[ChatCompletionMessageParam]
+    ) -> list[ChatCompletionMessageParam]:
+        """
+        Convert Gemini model's extra_content format to provider_specific_fields format for litellm.
+
+        Transforms tool calls from internal format:
+            extra_content={"google": {"thought_signature": "..."}}
+        To litellm format:
+            provider_specific_fields={"thought_signature": "..."}
+
+        Only processes tool_calls that appear after the last user message.
+        See: https://ai.google.dev/gemini-api/docs/thought-signatures
+        """
+
+        # Find the index of the last user message
+        last_user_index = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                last_user_index = i
+                break
+
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+
+            # Only process assistant messages that come after the last user message
+            # If no user message found (last_user_index == -1), process all messages
+            if last_user_index != -1 and i <= last_user_index:
+                continue
+
+            # Check if this is an assistant message with tool calls
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                tool_calls = message.get("tool_calls", [])
+
+                for tool_call in tool_calls:  # type: ignore[attr-defined]
+                    if not isinstance(tool_call, dict):
+                        continue
+
+                    # Default to skip validator, overridden if valid thought signature exists
+                    tool_call["provider_specific_fields"] = {
+                        "thought_signature": "skip_thought_signature_validator"
+                    }
+
+                    # Override with actual thought signature if extra_content exists
+                    if "extra_content" in tool_call:
+                        extra_content = tool_call.pop("extra_content")
+                        if isinstance(extra_content, dict):
+                            # Extract google-specific fields
+                            google_fields = extra_content.get("google")
+                            if google_fields and isinstance(google_fields, dict):
+                                thought_sig = google_fields.get("thought_signature")
+                                if thought_sig:
+                                    tool_call["provider_specific_fields"] = {
+                                        "thought_signature": thought_sig
+                                    }
+
+        return messages
+
+    def _fix_tool_message_ordering(
+        self, messages: list[ChatCompletionMessageParam]
+    ) -> list[ChatCompletionMessageParam]:
+        """
+        Fix the ordering of tool messages to ensure tool_use messages come before tool_result messages.
+
+        Required for Anthropic and Vertex AI Gemini APIs which require tool calls to immediately
+        precede their corresponding tool responses in conversation history.
+        """  # noqa: E501
+        if not messages:
+            return messages
+
+        # Collect all tool calls and tool results
+        tool_call_messages = {}  # tool_id -> (index, message)
+        tool_result_messages = {}  # tool_id -> (index, message)
+        other_messages = []  # (index, message) for non-tool messages
+
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                other_messages.append((i, message))
+                continue
+
+            role = message.get("role")
+
+            if role == "assistant" and message.get("tool_calls"):
+                # Extract tool calls from this assistant message
+                tool_calls = message.get("tool_calls", [])
+                if isinstance(tool_calls, list):
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, dict):
+                            tool_id = tool_call.get("id")
+                            if tool_id:
+                                # Create a separate assistant message for each tool call
+                                single_tool_msg = cast(dict[str, Any], message.copy())
+                                single_tool_msg["tool_calls"] = [tool_call]
+                                tool_call_messages[tool_id] = (
+                                    i,
+                                    cast(ChatCompletionMessageParam, single_tool_msg),
+                                )
+
+            elif role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if tool_call_id:
+                    tool_result_messages[tool_call_id] = (i, message)
+                else:
+                    other_messages.append((i, message))
+            else:
+                other_messages.append((i, message))
+
+        # First, identify which tool results will be paired to avoid duplicates
+        paired_tool_result_indices = set()
+        for tool_id in tool_call_messages:
+            if tool_id in tool_result_messages:
+                tool_result_idx, _ = tool_result_messages[tool_id]
+                paired_tool_result_indices.add(tool_result_idx)
+
+        # Create the fixed message sequence
+        fixed_messages: list[ChatCompletionMessageParam] = []
+        used_indices = set()
+
+        # Add messages in their original order, but ensure tool_use → tool_result pairing
+        for i, original_message in enumerate(messages):
+            if i in used_indices:
+                continue
+
+            if not isinstance(original_message, dict):
+                fixed_messages.append(original_message)
+                used_indices.add(i)
+                continue
+
+            role = original_message.get("role")
+
+            if role == "assistant" and original_message.get("tool_calls"):
+                # Process each tool call in this assistant message
+                tool_calls = original_message.get("tool_calls", [])
+                if isinstance(tool_calls, list):
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, dict):
+                            tool_id = tool_call.get("id")
+                            if (
+                                tool_id
+                                and tool_id in tool_call_messages
+                                and tool_id in tool_result_messages
+                            ):
+                                # Add tool_use → tool_result pair
+                                _, tool_call_msg = tool_call_messages[tool_id]
+                                tool_result_idx, tool_result_msg = tool_result_messages[tool_id]
+
+                                fixed_messages.append(tool_call_msg)
+                                fixed_messages.append(tool_result_msg)
+
+                                # Mark both as used
+                                used_indices.add(tool_call_messages[tool_id][0])
+                                used_indices.add(tool_result_idx)
+                            elif tool_id and tool_id in tool_call_messages:
+                                # Tool call without result - add just the tool call
+                                _, tool_call_msg = tool_call_messages[tool_id]
+                                fixed_messages.append(tool_call_msg)
+                                used_indices.add(tool_call_messages[tool_id][0])
+
+                used_indices.add(i)  # Mark original multi-tool message as used
+
+            elif role == "tool":
+                # Only preserve unmatched tool results to avoid duplicates
+                if i not in paired_tool_result_indices:
+                    fixed_messages.append(original_message)
+                used_indices.add(i)
+
+            else:
+                # Regular message - add it normally
+                fixed_messages.append(original_message)
+                used_indices.add(i)
+
+        return fixed_messages
+
     def _remove_not_given(self, value: Any) -> Any:
-        if isinstance(value, NotGiven):
+        if value is omit or isinstance(value, NotGiven):
             return None
         return value
+
+    def _merge_headers(self, model_settings: ModelSettings):
+        return {**HEADERS, **(model_settings.extra_headers or {}), **(HEADERS_OVERRIDE.get() or {})}
 
 
 class LitellmConverter:
     @classmethod
     def convert_message_to_openai(
-        cls, message: litellm.types.utils.Message
+        cls, message: litellm.types.utils.Message, model: str | None = None
     ) -> ChatCompletionMessage:
+        """
+        Convert a LiteLLM message to OpenAI ChatCompletionMessage format.
+
+        Args:
+            message: The LiteLLM message to convert
+            model: The target model to convert to. Used to handle provider-specific
+                transformations.
+        """
         if message.role != "assistant":
             raise ModelBehaviorError(f"Unsupported role: {message.role}")
 
-        tool_calls = (
-            [LitellmConverter.convert_tool_call_to_openai(tool) for tool in message.tool_calls]
+        tool_calls: (
+            list[ChatCompletionMessageFunctionToolCall | ChatCompletionMessageCustomToolCall] | None
+        ) = (
+            [
+                LitellmConverter.convert_tool_call_to_openai(tool, model=model)
+                for tool in message.tool_calls
+            ]
             if message.tool_calls
             else None
         )
@@ -360,13 +755,39 @@ class LitellmConverter:
             provider_specific_fields.get("refusal", None) if provider_specific_fields else None
         )
 
-        return ChatCompletionMessage(
+        reasoning_content = ""
+        if hasattr(message, "reasoning_content") and message.reasoning_content:
+            reasoning_content = message.reasoning_content
+
+        # Extract full thinking blocks including signatures (for Anthropic)
+        thinking_blocks: list[dict[str, Any]] | None = None
+        if hasattr(message, "thinking_blocks") and message.thinking_blocks:
+            # Convert thinking blocks to dict format for compatibility
+            thinking_blocks = []
+            for block in message.thinking_blocks:
+                if isinstance(block, dict):
+                    thinking_blocks.append(cast(dict[str, Any], block))
+                else:
+                    # Convert object to dict by accessing its attributes
+                    block_dict: dict[str, Any] = {}
+                    if hasattr(block, "__dict__"):
+                        block_dict = dict(block.__dict__.items())
+                    elif hasattr(block, "model_dump"):
+                        block_dict = block.model_dump()
+                    else:
+                        # Last resort: convert to string representation
+                        block_dict = {"thinking": str(block)}
+                    thinking_blocks.append(block_dict)
+
+        return InternalChatCompletionMessage(
             content=message.content,
             refusal=refusal,
             role="assistant",
             annotations=cls.convert_annotations_to_openai(message),
             audio=message.get("audio", None),  # litellm deletes audio if not present
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
+            thinking_blocks=thinking_blocks,
         )
 
     @classmethod
@@ -394,12 +815,38 @@ class LitellmConverter:
 
     @classmethod
     def convert_tool_call_to_openai(
-        cls, tool_call: litellm.types.utils.ChatCompletionMessageToolCall
-    ) -> ChatCompletionMessageToolCall:
-        return ChatCompletionMessageToolCall(
-            id=tool_call.id,
+        cls, tool_call: litellm.types.utils.ChatCompletionMessageToolCall, model: str | None = None
+    ) -> ChatCompletionMessageFunctionToolCall:
+        # Clean up litellm's addition of __thought__ suffix to tool_call.id for
+        # Gemini models. See: https://github.com/BerriAI/litellm/pull/16895
+        tool_call_id = ChatCmplHelpers.clean_gemini_tool_call_id(tool_call.id, model)
+
+        # Convert litellm's tool call format to chat completion message format
+        base_tool_call = ChatCompletionMessageFunctionToolCall(
+            id=tool_call_id,
             type="function",
             function=Function(
-                name=tool_call.function.name or "", arguments=tool_call.function.arguments
+                name=tool_call.function.name or "",
+                arguments=tool_call.function.arguments,
             ),
         )
+
+        # Preserve provider-specific fields if present (e.g., Gemini thought signatures)
+        if hasattr(tool_call, "provider_specific_fields") and tool_call.provider_specific_fields:
+            # Convert to nested extra_content structure
+            extra_content: dict[str, Any] = {}
+            provider_fields = tool_call.provider_specific_fields
+
+            # Check for thought_signature (Gemini specific)
+            if model and "gemini" in model.lower():
+                if "thought_signature" in provider_fields:
+                    extra_content["google"] = {
+                        "thought_signature": provider_fields["thought_signature"]
+                    }
+
+            return InternalToolCall(
+                **base_tool_call.model_dump(),
+                extra_content=extra_content if extra_content else None,
+            )
+
+        return base_tool_call

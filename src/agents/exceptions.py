@@ -8,6 +8,11 @@ if TYPE_CHECKING:
     from .guardrail import InputGuardrailResult, OutputGuardrailResult
     from .items import ModelResponse, RunItem, TResponseInputItem
     from .run_context import RunContextWrapper
+    from .tool_guardrails import (
+        ToolGuardrailFunctionOutput,
+        ToolInputGuardrail,
+        ToolOutputGuardrail,
+    )
 
 from .util._pretty_print import pretty_print_run_error_details
 
@@ -70,6 +75,18 @@ class UserError(AgentsException):
         super().__init__(message)
 
 
+class ToolTimeoutError(AgentsException):
+    """Exception raised when a function tool invocation exceeds its timeout."""
+
+    tool_name: str
+    timeout_seconds: float
+
+    def __init__(self, tool_name: str, timeout_seconds: float):
+        self.tool_name = tool_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"Tool '{tool_name}' timed out after {timeout_seconds:g} seconds.")
+
+
 class InputGuardrailTripwireTriggered(AgentsException):
     """Exception raised when a guardrail tripwire is triggered."""
 
@@ -94,3 +111,33 @@ class OutputGuardrailTripwireTriggered(AgentsException):
         super().__init__(
             f"Guardrail {guardrail_result.guardrail.__class__.__name__} triggered tripwire"
         )
+
+
+class ToolInputGuardrailTripwireTriggered(AgentsException):
+    """Exception raised when a tool input guardrail tripwire is triggered."""
+
+    guardrail: ToolInputGuardrail[Any]
+    """The guardrail that was triggered."""
+
+    output: ToolGuardrailFunctionOutput
+    """The output from the guardrail function."""
+
+    def __init__(self, guardrail: ToolInputGuardrail[Any], output: ToolGuardrailFunctionOutput):
+        self.guardrail = guardrail
+        self.output = output
+        super().__init__(f"Tool input guardrail {guardrail.__class__.__name__} triggered tripwire")
+
+
+class ToolOutputGuardrailTripwireTriggered(AgentsException):
+    """Exception raised when a tool output guardrail tripwire is triggered."""
+
+    guardrail: ToolOutputGuardrail[Any]
+    """The guardrail that was triggered."""
+
+    output: ToolGuardrailFunctionOutput
+    """The output from the guardrail function."""
+
+    def __init__(self, guardrail: ToolOutputGuardrail[Any], output: ToolGuardrailFunctionOutput):
+        self.guardrail = guardrail
+        self.output = output
+        super().__init__(f"Tool output guardrail {guardrail.__class__.__name__} triggered tripwire")
