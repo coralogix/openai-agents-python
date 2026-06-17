@@ -722,10 +722,15 @@ class ChatCmplStreamHandler:
                     and usage.completion_tokens_details.reasoning_tokens
                     else 0
                 ),
-                input_tokens_details=InputTokensDetails(
+                input_tokens_details=InputTokensDetails(  # type: ignore[call-arg]
                     cached_tokens=usage.prompt_tokens_details.cached_tokens
                     if usage.prompt_tokens_details and usage.prompt_tokens_details.cached_tokens
-                    else 0
+                    else 0,
+                    cache_creation_tokens=usage.prompt_tokens_details.cache_creation_tokens
+                    if usage.prompt_tokens_details
+                    and hasattr(usage.prompt_tokens_details, "cache_creation_tokens")
+                    and usage.prompt_tokens_details.cache_creation_tokens
+                    else 0,
                 ),
             )
             if usage
