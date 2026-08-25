@@ -441,11 +441,21 @@ class Converter:
                 )
             elif isinstance(c, dict) and c.get("type") == "input_file":
                 casted_file_param = cast(ResponseInputFileParam, c)
-                if "file_data" not in casted_file_param or not casted_file_param["file_data"]:
+                file_data = casted_file_param.get("file_data")
+                file_url = casted_file_param.get("file_url")
+                file_id = casted_file_param.get("file_id")
+
+                if file_data is not None:
+                    filedata = FileFile(file_data=file_data)
+                elif file_url is not None:
+                    filedata = FileFile(file_id=file_url)
+                elif file_id is not None:
+                    filedata = FileFile(file_id=file_id)
+                else:
                     raise UserError(
-                        f"Only file_data is supported for input_file {casted_file_param}"
+                        "input_file must include file_data, file_url, or file_id: "
+                        f"{casted_file_param}"
                     )
-                filedata = FileFile(file_data=casted_file_param["file_data"])
 
                 if "filename" in casted_file_param and casted_file_param["filename"]:
                     filedata["filename"] = casted_file_param["filename"]
