@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
-from openai import AsyncOpenAI, omit
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, omit
 from openai.types.chat.chat_completion import ChatCompletion, Choice, ChoiceLogprobs
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
@@ -30,16 +30,60 @@ from openai.types.responses import (
 )
 
 from agents import (
+    Agent,
     ModelResponse,
+    ModelRetryAdviceRequest,
     ModelSettings,
     ModelTracing,
     OpenAIChatCompletionsModel,
     OpenAIProvider,
+    Runner,
     __version__,
     generation_span,
 )
+from agents.models._retry_runtime import provider_managed_retries_disabled
 from agents.models.chatcmpl_helpers import HEADERS_OVERRIDE, ChatCmplHelpers
 from agents.models.fake_id import FAKE_RESPONSES_ID
+
+
+async def _run_chat_completions_model_with_custom_base_url(
+    model_settings: ModelSettings | None = None,
+) -> dict[str, Any]:
+    class DummyCompletions:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.kwargs = kwargs
+            return ChatCompletion(
+                id="resp-id",
+                created=0,
+                model="fake",
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        index=0,
+                        finish_reason="stop",
+                        message=ChatCompletionMessage(role="assistant", content="ok"),
+                    )
+                ],
+            )
+
+    class DummyClient:
+        def __init__(self, completions: DummyCompletions) -> None:
+            self.chat = type("_Chat", (), {"completions": completions})()
+            self.base_url = httpx.URL("https://custom.example.test/v1/")
+
+    completions = DummyCompletions()
+    model = OpenAIChatCompletionsModel(
+        model="gpt-4",
+        openai_client=DummyClient(completions),  # type: ignore[arg-type]
+    )
+    agent = Agent(name="test", model=model, model_settings=model_settings or ModelSettings())
+
+    await Runner.run(agent, "hi")
+
+    return completions.kwargs
 
 
 @pytest.mark.allow_call_model_methods
@@ -261,6 +305,27 @@ async def test_get_response_with_tool_call(monkeypatch) -> None:
     assert fn_call_item.arguments == "{'x':1}"
 
 
+def test_get_client_disables_provider_managed_retries_on_runner_retry() -> None:
+    class DummyChatCompletionsClient:
+        def __init__(self) -> None:
+            self.base_url = httpx.URL("https://api.openai.com/v1/")
+            self.chat = type("ChatNamespace", (), {"completions": object()})()
+            self.with_options_calls: list[dict[str, Any]] = []
+
+        def with_options(self, **kwargs):
+            self.with_options_calls.append(kwargs)
+            return self
+
+    client = DummyChatCompletionsClient()
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    assert cast(object, model._get_client()) is client
+    with provider_managed_retries_disabled(True):
+        assert cast(object, model._get_client()) is client
+
+    assert client.with_options_calls == [{"max_retries": 0}]
+
+
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
 async def test_get_response_with_no_message(monkeypatch) -> None:
@@ -361,6 +426,102 @@ async def test_fetch_response_non_stream(monkeypatch) -> None:
     assert kwargs["stream_options"] is omit
 
 
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_custom_base_url_prompt_cache_key_uses_model_settings_only() -> None:
+    default_kwargs = await _run_chat_completions_model_with_custom_base_url()
+    explicit_kwargs = await _run_chat_completions_model_with_custom_base_url(
+        model_settings=ModelSettings(extra_args={"prompt_cache_key": "cache-key"})
+    )
+
+    assert "prompt_cache_key" not in default_kwargs
+    assert explicit_kwargs["prompt_cache_key"] == "cache-key"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_get_response_accepts_raw_chat_completions_image_content() -> None:
+    """
+    Raw Chat Completions content parts should be accepted on the SDK input path
+    when using the Chat Completions backend.
+    """
+
+    class DummyCompletions:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.kwargs = kwargs
+            return chat
+
+    class DummyClient:
+        def __init__(self, completions: DummyCompletions) -> None:
+            self.chat = type("_Chat", (), {"completions": completions})()
+            self.base_url = httpx.URL("https://api.openai.com/v1/")
+
+    msg = ChatCompletionMessage(role="assistant", content="ok")
+    choice = Choice(index=0, finish_reason="stop", message=msg)
+    chat = ChatCompletion(
+        id="resp-id",
+        created=0,
+        model="fake",
+        object="chat.completion",
+        choices=[choice],
+        usage=None,
+    )
+    completions = DummyCompletions()
+    dummy_client = DummyClient(completions)
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=dummy_client)  # type: ignore[arg-type]
+
+    await model.get_response(
+        system_instructions=None,
+        input=[
+            # Cast the fixture because the raw chat-style alias is intentionally outside the
+            # canonical TypedDict shape that mypy expects for ordinary SDK inputs.
+            cast(
+                Any,
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,AAAA",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            )
+        ],
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+
+    assert completions.kwargs["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fetch_response_stream(monkeypatch) -> None:
     """
@@ -433,6 +594,112 @@ def test_store_param():
     assert ChatCmplHelpers.get_store_param(client, model_settings) is True, (
         "Should respect explicitly set store=True"
     )
+
+
+def test_get_retry_advice_uses_openai_headers() -> None:
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    response = httpx.Response(
+        429,
+        request=request,
+        headers={
+            "x-should-retry": "true",
+            "retry-after-ms": "500",
+            "x-request-id": "req_123",
+        },
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = APIStatusError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.retry_after == 0.5
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.error_code == "rate_limit"
+    assert advice.normalized.status_code == 429
+    assert advice.normalized.request_id == "req_123"
+
+
+def test_get_retry_advice_keeps_stateful_transport_failures_ambiguous() -> None:
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=cast(Any, object()))
+    error = APIConnectionError(
+        message="connection error",
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+    assert advice.normalized is not None
+    assert advice.normalized.is_network_error is True
+
+
+def test_get_retry_advice_marks_stateful_http_failures_replay_safe() -> None:
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = APIStatusError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.status_code == 429
+
+
+def test_get_client_disables_provider_managed_retries_when_requested() -> None:
+    class DummyClient:
+        def __init__(self):
+            self.calls: list[dict[str, int]] = []
+
+        def with_options(self, **kwargs):
+            self.calls.append(kwargs)
+            return "retry-client"
+
+    client = DummyClient()
+    model = OpenAIChatCompletionsModel(model="gpt-4", openai_client=cast(Any, client))
+
+    assert cast(object, model._get_client()) is client
+
+    with provider_managed_retries_disabled(True):
+        assert cast(object, model._get_client()) == "retry-client"
+
+    assert client.calls == [{"max_retries": 0}]
 
 
 @pytest.mark.allow_call_model_methods

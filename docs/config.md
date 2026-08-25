@@ -1,4 +1,16 @@
-# Configuring the SDK
+# Configuration
+
+This page covers SDK-wide defaults that you usually set once during application startup, such as the default OpenAI key or client, the default OpenAI API shape, tracing export defaults, and logging behavior.
+
+These defaults still apply to sandbox-based workflows, but sandbox workspaces, sandbox clients, and session reuse are configured separately.
+
+If you need to configure a specific agent or run instead, start with:
+
+-   [Agents](agents.md) for instructions, tools, output types, handoffs, and guardrails on a plain `Agent`.
+-   [Running agents](running_agents.md) for `RunConfig`, sessions, and conversation-state options.
+-   [Sandbox agents](sandbox/guide.md) for `SandboxRunConfig`, manifests, capabilities, and sandbox-client-specific workspace setup.
+-   [Models](models/index.md) for model selection and provider configuration.
+-   [Tracing](tracing.md) for per-run tracing metadata and custom trace processors.
 
 ## API keys and clients
 
@@ -30,7 +42,7 @@ set_default_openai_api("chat_completions")
 
 ## Tracing
 
-Tracing is enabled by default. It uses the OpenAI API keys from the section above by default (i.e. the environment variable or the default key you set). You can specifically set the API key used for tracing by using the [`set_tracing_export_api_key`][agents.set_tracing_export_api_key] function.
+Tracing is enabled by default. By default it uses the same OpenAI API key as your model requests from the section above (that is, the environment variable or the default key you set). You can specifically set the API key used for tracing by using the [`set_tracing_export_api_key`][agents.set_tracing_export_api_key] function.
 
 ```python
 from agents import set_tracing_export_api_key

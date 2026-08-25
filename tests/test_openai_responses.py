@@ -2,23 +2,73 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
 import pytest
-from openai import NOT_GIVEN, omit
+from openai import NOT_GIVEN, APIConnectionError, RateLimitError, omit
 from openai.types.responses import ResponseCompletedEvent
 from openai.types.shared.reasoning import Reasoning
 
-from agents import ModelSettings, ModelTracing, __version__
+from agents import (
+    Agent,
+    AsyncComputer,
+    Computer,
+    ComputerTool,
+    ModelSettings,
+    ModelTracing,
+    Runner,
+    ToolSearchTool,
+    __version__,
+    trace,
+)
 from agents.exceptions import UserError
+from agents.models._retry_runtime import (
+    provider_managed_retries_disabled,
+    websocket_pre_event_retries_disabled,
+)
 from agents.models.openai_responses import (
     _HEADERS_OVERRIDE as RESP_HEADERS,
+    ConvertedTools,
+    Converter,
     OpenAIResponsesModel,
     OpenAIResponsesWSModel,
     ResponsesWebSocketError,
+    _should_retry_pre_event_websocket_disconnect,
 )
+from agents.retry import ModelRetryAdviceRequest
+from agents.usage import Usage
 from tests.fake_model import get_response_obj
+from tests.testing_processor import fetch_ordered_spans
+
+
+async def _run_responses_model_with_custom_base_url(
+    model_settings: ModelSettings | None = None,
+) -> dict[str, Any]:
+    class DummyResponses:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self, responses: DummyResponses) -> None:
+            self.responses = responses
+            self.base_url = httpx.URL("https://custom.example.test/v1/")
+
+    responses = DummyResponses()
+    model = OpenAIResponsesModel(
+        model="gpt-4",
+        openai_client=DummyResponsesClient(responses),  # type: ignore[arg-type]
+    )
+    agent = Agent(name="test", model=model, model_settings=model_settings or ModelSettings())
+
+    await Runner.run(agent, "hi")
+
+    return responses.kwargs
 
 
 class DummyWSConnection:
@@ -84,6 +134,14 @@ def _response_error_frame(code: str, message: str, sequence_number: int) -> str:
     )
 
 
+def _connection_closed_error(message: str) -> Exception:
+    class ConnectionClosedError(Exception):
+        pass
+
+    ConnectionClosedError.__module__ = "websockets.client"
+    return ConnectionClosedError(message)
+
+
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
 @pytest.mark.parametrize("override_ua", [None, "test_user_agent"])
@@ -141,6 +199,397 @@ async def test_user_agent_header_responses(override_ua: str | None):
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_get_response_exposes_request_id():
+    class DummyResponses:
+        async def create(self, **kwargs):
+            response = get_response_obj([], response_id="resp-request-id")
+            response._request_id = "req_nonstream_123"
+            return response
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    response = await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert response.response_id == "resp-request-id"
+    assert response.request_id == "req_nonstream_123"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_get_response_span_exports_usage():
+    class DummyResponses:
+        async def create(self, **kwargs):
+            return get_response_obj(
+                [],
+                response_id="resp-usage",
+                usage=Usage(requests=1, input_tokens=10, output_tokens=4, total_tokens=14),
+            )
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    with trace("test"):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.ENABLED,
+        )
+
+    response_spans = [
+        span.export() for span in fetch_ordered_spans() if span.span_data.type == "response"
+    ]
+    assert len(response_spans) == 1
+    assert response_spans[0]
+    assert response_spans[0]["span_data"] == {
+        "type": "response",
+        "response_id": "resp-usage",
+        "usage": {
+            "requests": 1,
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+
+
+def test_get_client_disables_provider_managed_retries_on_runner_retry() -> None:
+    class DummyResponsesClient:
+        def __init__(self) -> None:
+            self.responses = SimpleNamespace()
+            self.with_options_calls: list[dict[str, Any]] = []
+
+        def with_options(self, **kwargs):
+            self.with_options_calls.append(kwargs)
+            return self
+
+    client = DummyResponsesClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    assert cast(object, model._get_client()) is client
+    with provider_managed_retries_disabled(True):
+        assert cast(object, model._get_client()) is client
+
+    assert client.with_options_calls == [{"max_retries": 0}]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_fetch_response_stream_attaches_request_id_to_terminal_response():
+    class DummyHTTPStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([], response_id="resp-stream-request-id"),
+                sequence_number=0,
+            )
+
+    inner_stream = DummyHTTPStream()
+
+    class DummyAPIResponse:
+        def __init__(self):
+            self.request_id = "req_stream_123"
+            self.close_calls = 0
+            self.parse_calls = 0
+
+        async def parse(self):
+            self.parse_calls += 1
+            return inner_stream
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    api_response = DummyAPIResponse()
+    aexit_calls: list[tuple[Any, Any, Any]] = []
+
+    class DummyStreamingContextManager:
+        async def __aenter__(self):
+            return api_response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            aexit_calls.append((exc_type, exc, tb))
+            await api_response.close()
+            return False
+
+    class DummyResponses:
+        def __init__(self):
+            self.with_streaming_response = SimpleNamespace(create=self.create_streaming)
+
+        def create_streaming(self, **kwargs):
+            return DummyStreamingContextManager()
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    stream = await model._fetch_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        previous_response_id=None,
+        conversation_id=None,
+        stream=True,
+    )
+
+    stream_agen = cast(Any, stream)
+    event = await stream_agen.__anext__()
+
+    assert getattr(stream, "request_id", None) == "req_stream_123"
+    assert getattr(event.response, "_request_id", None) == "req_stream_123"
+
+    with pytest.raises(StopAsyncIteration):
+        await stream_agen.__anext__()
+
+    assert api_response.parse_calls == 1
+    assert api_response.close_calls == 1
+    assert aexit_calls == [(None, None, None)]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_fetch_response_stream_parse_failure_exits_streaming_context():
+    parse_error = RuntimeError("parse failed")
+    aexit_calls: list[tuple[Any, Any, Any]] = []
+
+    class DummyAPIResponse:
+        request_id = "req_stream_123"
+
+        async def parse(self):
+            raise parse_error
+
+    api_response = DummyAPIResponse()
+
+    class DummyStreamingContextManager:
+        async def __aenter__(self):
+            return api_response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            aexit_calls.append((exc_type, exc, tb))
+            return False
+
+    class DummyResponses:
+        def __init__(self):
+            self.with_streaming_response = SimpleNamespace(create=self.create_streaming)
+
+        def create_streaming(self, **kwargs):
+            return DummyStreamingContextManager()
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="parse failed"):
+        await model._fetch_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            previous_response_id=None,
+            conversation_id=None,
+            stream=True,
+        )
+
+    assert len(aexit_calls) == 1
+    exc_type, exc, tb = aexit_calls[0]
+    assert exc_type is RuntimeError
+    assert exc is parse_error
+    assert tb is not None
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_fetch_response_stream_without_request_id_still_returns_events():
+    class DummyHTTPStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([], response_id="resp-stream-request-id"),
+                sequence_number=0,
+            )
+
+    inner_stream = DummyHTTPStream()
+    aexit_calls: list[tuple[Any, Any, Any]] = []
+
+    class DummyAPIResponse:
+        def __init__(self):
+            self.close_calls = 0
+            self.parse_calls = 0
+
+        async def parse(self):
+            self.parse_calls += 1
+            return inner_stream
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    api_response = DummyAPIResponse()
+
+    class DummyStreamingContextManager:
+        async def __aenter__(self):
+            return api_response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            aexit_calls.append((exc_type, exc, tb))
+            await api_response.close()
+            return False
+
+    class DummyResponses:
+        def __init__(self):
+            self.with_streaming_response = SimpleNamespace(create=self.create_streaming)
+
+        def create_streaming(self, **kwargs):
+            return DummyStreamingContextManager()
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    stream = await model._fetch_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        previous_response_id=None,
+        conversation_id=None,
+        stream=True,
+    )
+
+    stream_agen = cast(Any, stream)
+    event = await stream_agen.__anext__()
+
+    assert getattr(stream, "request_id", None) is None
+    assert getattr(event.response, "_request_id", None) is None
+
+    with pytest.raises(StopAsyncIteration):
+        await stream_agen.__anext__()
+
+    assert api_response.parse_calls == 1
+    assert api_response.close_calls == 1
+    assert aexit_calls == [(None, None, None)]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_ignores_streaming_context_exit_failure_after_terminal_event():
+    class DummyHTTPStream:
+        def __init__(self):
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([], response_id="resp-stream-request-id"),
+                sequence_number=0,
+            )
+
+    inner_stream = DummyHTTPStream()
+    aexit_calls: list[tuple[Any, Any, Any]] = []
+
+    class DummyAPIResponse:
+        request_id = "req_stream_123"
+
+        async def parse(self):
+            return inner_stream
+
+    api_response = DummyAPIResponse()
+
+    class DummyStreamingContextManager:
+        async def __aenter__(self):
+            return api_response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            aexit_calls.append((exc_type, exc, tb))
+            raise RuntimeError("stream context exit failed")
+
+    class DummyResponses:
+        def __init__(self):
+            self.with_streaming_response = SimpleNamespace(create=self.create_streaming)
+
+        def create_streaming(self, **kwargs):
+            return DummyStreamingContextManager()
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=DummyResponsesClient())  # type: ignore[arg-type]
+
+    events: list[ResponseCompletedEvent] = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    ):
+        assert isinstance(event, ResponseCompletedEvent)
+        events.append(event)
+
+    assert len(events) == 1
+    assert aexit_calls == [(None, None, None)]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_stream_response_close_closes_inner_http_stream_with_async_close(monkeypatch):
     client = DummyWSClient()
     model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
@@ -189,6 +638,57 @@ async def test_stream_response_close_closes_inner_http_stream_with_async_close(m
 
     await stream_agen.aclose()
 
+    assert inner_stream.close_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_normal_exhaustion_closes_inner_http_stream(monkeypatch):
+    client = DummyWSClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    class DummyHTTPStream:
+        def __init__(self):
+            self._yielded = False
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([]),
+                sequence_number=0,
+            )
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    inner_stream = DummyHTTPStream()
+
+    async def fake_fetch_response(*args: Any, **kwargs: Any) -> DummyHTTPStream:
+        return inner_stream
+
+    monkeypatch.setattr(model, "_fetch_response", fake_fetch_response)
+
+    events: list[ResponseCompletedEvent] = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    ):
+        assert isinstance(event, ResponseCompletedEvent)
+        events.append(event)
+
+    assert len(events) == 1
     assert inner_stream.close_calls == 1
 
 
@@ -320,6 +820,91 @@ def test_build_response_create_kwargs_rejects_duplicate_extra_args_keys():
             stream=True,
             prompt=None,
         )
+
+
+@pytest.mark.allow_call_model_methods
+def test_build_response_create_kwargs_includes_extra_args_prompt_cache_key():
+    client = DummyWSClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    kwargs = model._build_response_create_kwargs(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(extra_args={"prompt_cache_key": "cache-key"}),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        previous_response_id=None,
+        conversation_id=None,
+        stream=False,
+        prompt=None,
+    )
+
+    assert kwargs["prompt_cache_key"] == "cache-key"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_custom_base_url_prompt_cache_key_uses_model_settings_only() -> None:
+    default_kwargs = await _run_responses_model_with_custom_base_url()
+    explicit_kwargs = await _run_responses_model_with_custom_base_url(
+        model_settings=ModelSettings(extra_args={"prompt_cache_key": "cache-key"})
+    )
+
+    assert "prompt_cache_key" not in default_kwargs
+    assert explicit_kwargs["prompt_cache_key"] == "cache-key"
+
+
+@pytest.mark.allow_call_model_methods
+def test_build_response_create_kwargs_preserves_unknown_response_include_values():
+    client = DummyWSClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    kwargs = model._build_response_create_kwargs(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(response_include=["response.future_flag"]),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        previous_response_id=None,
+        conversation_id=None,
+        stream=False,
+        prompt=None,
+    )
+
+    assert kwargs["include"] == ["response.future_flag"]
+
+
+@pytest.mark.allow_call_model_methods
+def test_build_response_create_kwargs_preserves_unknown_tool_types(monkeypatch) -> None:
+    client = DummyWSClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    future_tool = cast(Any, {"type": "future_beta_tool", "label": "preview"})
+
+    monkeypatch.setattr(
+        Converter,
+        "convert_tools",
+        classmethod(
+            lambda cls, tools, handoffs, **kwargs: ConvertedTools(tools=[future_tool], includes=[])
+        ),
+    )
+
+    kwargs = model._build_response_create_kwargs(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        previous_response_id=None,
+        conversation_id=None,
+        stream=False,
+        prompt=None,
+    )
+
+    assert kwargs["tools"] == [future_tool]
 
 
 @pytest.mark.allow_call_model_methods
@@ -464,6 +1049,481 @@ async def test_prompt_id_keeps_literal_tool_choice_without_local_tools(tool_choi
 
     assert called_kwargs["tools"] is omit
     assert called_kwargs["tool_choice"] == tool_choice
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_prompt_id_keeps_explicit_tool_search_without_local_surface() -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=False,
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[ToolSearchTool()],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        prompt={"id": "pmpt_123"},
+    )
+
+    assert called_kwargs["prompt"] == {"id": "pmpt_123"}
+    assert called_kwargs["tools"] == [{"type": "tool_search"}]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_ga_computer_tool_does_not_require_preview_metadata() -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(AsyncComputer):
+        async def screenshot(self) -> str:
+            return "screenshot"
+
+        async def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        async def double_click(self, x: int, y: int) -> None:
+            pass
+
+        async def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        async def keypress(self, keys: list[str]) -> None:
+            pass
+
+        async def move(self, x: int, y: int) -> None:
+            pass
+
+        async def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        async def type(self, text: str) -> None:
+            pass
+
+        async def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=True,
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[ComputerTool(computer=DummyComputer())],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        prompt=None,
+    )
+
+    assert called_kwargs["tools"] == [{"type": "computer"}]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_prompt_id_uses_preview_computer_payload_when_prompt_owns_model() -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(Computer):
+        @property
+        def environment(self) -> str:  # type: ignore[override]
+            return "mac"
+
+        @property
+        def dimensions(self) -> tuple[int, int]:
+            return (800, 600)
+
+        def screenshot(self) -> str:
+            return "screenshot"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        def double_click(self, x: int, y: int) -> None:
+            pass
+
+        def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        def keypress(self, keys: list[str]) -> None:
+            pass
+
+        def move(self, x: int, y: int) -> None:
+            pass
+
+        def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        def type(self, text: str) -> None:
+            pass
+
+        def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=False,
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[ComputerTool(computer=DummyComputer())],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        prompt={"id": "pmpt_123"},
+    )
+
+    assert called_kwargs["model"] is omit
+    assert called_kwargs["tool_choice"] is omit
+    assert called_kwargs["tools"] == [
+        {
+            "type": "computer_use_preview",
+            "environment": "mac",
+            "display_width": 800,
+            "display_height": 600,
+        }
+    ]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_prompt_id_computer_without_preview_metadata_raises_clear_error() -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(Computer):
+        def screenshot(self) -> str:
+            return "screenshot"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        def double_click(self, x: int, y: int) -> None:
+            pass
+
+        def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        def keypress(self, keys: list[str]) -> None:
+            pass
+
+        def move(self, x: int, y: int) -> None:
+            pass
+
+        def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        def type(self, text: str) -> None:
+            pass
+
+        def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=False,
+    )
+
+    with pytest.raises(
+        UserError,
+        match="Preview computer tool payloads require `environment` and `dimensions`",
+    ):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[ComputerTool(computer=DummyComputer())],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            prompt={"id": "pmpt_123"},
+        )
+
+    assert called_kwargs == {}
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_prompt_id_unresolved_computer_uses_preview_payload_shape() -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(Computer):
+        @property
+        def environment(self) -> str:  # type: ignore[override]
+            return "mac"
+
+        @property
+        def dimensions(self) -> tuple[int, int]:
+            return (800, 600)
+
+        def screenshot(self) -> str:
+            return "screenshot"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        def double_click(self, x: int, y: int) -> None:
+            pass
+
+        def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        def keypress(self, keys: list[str]) -> None:
+            pass
+
+        def move(self, x: int, y: int) -> None:
+            pass
+
+        def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        def type(self, text: str) -> None:
+            pass
+
+        def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=False,
+    )
+
+    with pytest.raises(UserError, match="Computer tool is not initialized for serialization"):
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(),
+            tools=[ComputerTool(computer=lambda **_: DummyComputer())],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            prompt={"id": "pmpt_123"},
+        )
+
+    assert called_kwargs == {}
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_choice", ["computer", "computer_use"])
+async def test_prompt_id_explicit_ga_computer_tool_choice_uses_ga_selector_and_tool(
+    tool_choice: str,
+) -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(Computer):
+        @property
+        def environment(self) -> str:  # type: ignore[override]
+            return "mac"
+
+        @property
+        def dimensions(self) -> tuple[int, int]:
+            return (800, 600)
+
+        def screenshot(self) -> str:
+            return "screenshot"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        def double_click(self, x: int, y: int) -> None:
+            pass
+
+        def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        def keypress(self, keys: list[str]) -> None:
+            pass
+
+        def move(self, x: int, y: int) -> None:
+            pass
+
+        def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        def type(self, text: str) -> None:
+            pass
+
+        def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="gpt-5.4",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+        model_is_explicit=False,
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(tool_choice=tool_choice),
+        tools=[ComputerTool(computer=DummyComputer())],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        prompt={"id": "pmpt_123"},
+    )
+
+    assert called_kwargs["model"] is omit
+    assert called_kwargs["tool_choice"] == {"type": "computer"}
+    assert called_kwargs["tools"] == [{"type": "computer"}]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_choice", ["computer", "computer_use"])
+async def test_preview_model_forced_computer_tool_choice_uses_preview_selector(
+    tool_choice: str,
+) -> None:
+    called_kwargs: dict[str, Any] = {}
+
+    class DummyComputer(Computer):
+        @property
+        def environment(self) -> str:  # type: ignore[override]
+            return "mac"
+
+        @property
+        def dimensions(self) -> tuple[int, int]:
+            return (800, 600)
+
+        def screenshot(self) -> str:
+            return "screenshot"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            pass
+
+        def double_click(self, x: int, y: int) -> None:
+            pass
+
+        def drag(self, path: list[tuple[int, int]]) -> None:
+            pass
+
+        def keypress(self, keys: list[str]) -> None:
+            pass
+
+        def move(self, x: int, y: int) -> None:
+            pass
+
+        def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+            pass
+
+        def type(self, text: str) -> None:
+            pass
+
+        def wait(self) -> None:
+            pass
+
+    class DummyResponses:
+        async def create(self, **kwargs):
+            nonlocal called_kwargs
+            called_kwargs = kwargs
+            return get_response_obj([])
+
+    class DummyResponsesClient:
+        def __init__(self):
+            self.responses = DummyResponses()
+
+    model = OpenAIResponsesModel(
+        model="computer-use-preview",
+        openai_client=DummyResponsesClient(),  # type: ignore[arg-type]
+    )
+
+    await model.get_response(
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(tool_choice=tool_choice),
+        tools=[ComputerTool(computer=DummyComputer())],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert called_kwargs["model"] == "computer-use-preview"
+    assert called_kwargs["tool_choice"] == {"type": "computer_use_preview"}
+    assert called_kwargs["tools"] == [
+        {
+            "type": "computer_use_preview",
+            "environment": "mac",
+            "display_width": 800,
+            "display_height": 600,
+        }
+    ]
 
 
 @pytest.mark.allow_call_model_methods
@@ -1652,6 +2712,63 @@ async def test_websocket_model_get_response_applies_timeout_to_recv(monkeypatch)
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_websocket_model_get_response_marks_partial_receive_timeout_unsafe_to_replay(
+    monkeypatch,
+):
+    client = DummyWSClient()
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=client)  # type: ignore[arg-type]
+
+    class PartialThenSlowRecvWSConnection(DummyWSConnection):
+        def __init__(self) -> None:
+            super().__init__([_response_event_frame("response.created", "resp-partial", 1)])
+            self.recv_calls = 0
+
+        async def recv(self) -> str:
+            self.recv_calls += 1
+            if self.recv_calls == 1:
+                return await super().recv()
+            await asyncio.sleep(0.2)
+            return await super().recv()
+
+    ws = PartialThenSlowRecvWSConnection()
+
+    async def fake_open(
+        ws_url: str, headers: dict[str, str], *, connect_timeout: float | None = None
+    ) -> DummyWSConnection:
+        return ws
+
+    monkeypatch.setattr(model, "_open_websocket_connection", fake_open)
+
+    with pytest.raises(TimeoutError, match="Responses websocket receive timed out") as exc_info:
+        await model.get_response(
+            system_instructions=None,
+            input="hi",
+            model_settings=ModelSettings(extra_args={"timeout": 0.01}),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+
+    error = exc_info.value
+    assert getattr(error, "_openai_agents_ws_replay_safety", None) == "unsafe"
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+    assert ws.close_calls == 1
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_websocket_model_get_response_applies_timeout_while_waiting_for_request_lock(
     monkeypatch,
 ):
@@ -2099,3 +3216,366 @@ async def test_websocket_model_open_websocket_connection_honors_connect_timeout(
 
     assert result is sentinel
     assert captured["kwargs"]["open_timeout"] == 42.0
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_uses_openai_headers() -> None:
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        429,
+        request=request,
+        headers={
+            "x-should-retry": "true",
+            "retry-after-ms": "250",
+            "x-request-id": "req_456",
+        },
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = RateLimitError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.retry_after == 0.25
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.error_code == "rate_limit"
+    assert advice.normalized.status_code == 429
+    assert advice.normalized.request_id == "req_456"
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_keeps_stateful_transport_failures_ambiguous() -> None:
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+    error = APIConnectionError(
+        message="connection error",
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+    assert advice.normalized is not None
+    assert advice.normalized.is_network_error is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_marks_stateful_http_failures_replay_safe() -> None:
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={"error": {"code": "rate_limit"}},
+    )
+    error = RateLimitError(
+        "rate limited", response=response, body={"error": {"code": "rate_limit"}}
+    )
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+    assert advice.normalized is not None
+    assert advice.normalized.status_code == 429
+
+
+@pytest.mark.allow_call_model_methods
+def test_get_retry_advice_keeps_stateless_transport_failures_retryable() -> None:
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, object()))
+    error = APIConnectionError(
+        message="connection error",
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+    assert advice.normalized is not None
+    assert advice.normalized.is_network_error is True
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_ambiguous_replay_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError("Responses websocket connection closed before a terminal response event.")
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_ambiguous_disconnect_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError("Responses websocket connection closed before a terminal response event.")
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_keeps_wrapped_pre_send_disconnect_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "safe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed before request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_wrapped_post_send_disconnect_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_nonstream_post_send_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_wrapped_post_send_disconnect_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = RuntimeError(
+        "Responses websocket connection closed before any response events were received."
+    )
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    error.__cause__ = _connection_closed_error("peer closed after request send")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_partial_nonstream_failure_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+    setattr(error, "_openai_agents_ws_replay_safety", "unsafe")  # noqa: B010
+    setattr(error, "_openai_agents_ws_response_started", True)  # noqa: B010
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_connect_timeout_replay_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket connect timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_request_lock_timeout_replay_safe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket request lock wait timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=False,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety == "safe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_marks_stateful_receive_timeout_unsafe() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+            previous_response_id="resp_prev",
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is False
+    assert advice.replay_safety == "unsafe"
+
+
+@pytest.mark.allow_call_model_methods
+def test_websocket_get_retry_advice_allows_stateless_receive_timeout_retry() -> None:
+    model = OpenAIResponsesWSModel(model="gpt-4", openai_client=cast(Any, DummyWSClient()))
+    error = TimeoutError("Responses websocket receive timed out after 5.0 seconds.")
+
+    advice = model.get_retry_advice(
+        ModelRetryAdviceRequest(
+            error=error,
+            attempt=1,
+            stream=True,
+        )
+    )
+
+    assert advice is not None
+    assert advice.suggested is True
+    assert advice.replay_safety is None
+
+
+def test_get_client_disables_provider_managed_retries_when_requested() -> None:
+    class DummyClient:
+        def __init__(self):
+            self.calls: list[dict[str, int]] = []
+
+        def with_options(self, **kwargs):
+            self.calls.append(kwargs)
+            return "retry-client"
+
+    client = DummyClient()
+    model = OpenAIResponsesModel(model="gpt-4", openai_client=cast(Any, client))
+
+    assert cast(object, model._get_client()) is client
+
+    with provider_managed_retries_disabled(True):
+        assert cast(object, model._get_client()) == "retry-client"
+
+    assert client.calls == [{"max_retries": 0}]
+
+
+def test_websocket_pre_event_disconnect_retry_respects_websocket_retry_disable() -> None:
+    assert _should_retry_pre_event_websocket_disconnect() is True
+
+    with websocket_pre_event_retries_disabled(True):
+        assert _should_retry_pre_event_websocket_disconnect() is False
